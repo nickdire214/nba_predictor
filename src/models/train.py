@@ -4,6 +4,10 @@ import os
 import json
 import unicodedata
 from loguru import logger
+import joblib
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 
@@ -165,6 +169,39 @@ def save_model(model, metrics: dict, model_file: str, target: str):
     logger.info(f"{target} model saved to {model_path}")
 
 
+def train_ridge_model(X_train, y_train, X_test, y_test, stat: str):
+    """
+    Train a Ridge regression pipeline (StandardScaler + Ridge(alpha=1.0)).
+    Saves the fitted pipeline to models/{stat}_model_ridge.pkl and
+    metrics to models/{stat}_ridge_metrics.json.
+    """
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge",  Ridge(alpha=1.0)),
+    ])
+    logger.info(f"Training {stat} Ridge model...")
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+    mae  = mean_absolute_error(y_test, preds)
+    rmse = mean_squared_error(y_test, preds) ** 0.5
+    r2   = r2_score(y_test, preds)
+    metrics = {"MAE": round(mae, 3), "RMSE": round(rmse, 3), "R2": round(r2, 3)}
+    logger.info(f"{stat} Ridge -> MAE: {mae:.2f} | RMSE: {rmse:.2f} | R2: {r2:.3f}")
+
+    os.makedirs("models", exist_ok=True)
+    stat_lower = stat.lower()
+    pkl_path     = os.path.join("models", f"{stat_lower}_model_ridge.pkl")
+    metrics_path = os.path.join("models", f"{stat_lower}_ridge_metrics.json")
+
+    joblib.dump(model, pkl_path)
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    logger.info(f"Saved {stat} Ridge model -> {pkl_path}")
+    return model, metrics
+
+
 def train_quantile_models(X_train, y_train, stat: str):
     """
     Train lower (10th pct) and upper (90th pct) quantile models alongside
@@ -244,6 +281,11 @@ if __name__ == "__main__":
         show_feature_importance(model, X_train.columns.tolist(), stat)
 
         train_quantile_models(X_train, y_train, stat)
+
+        ridge_model, ridge_metrics = train_ridge_model(
+            X_train, y_train, X_test, y_test, stat
+        )
+        print(f"  Ridge -> MAE: {ridge_metrics['MAE']}  RMSE: {ridge_metrics['RMSE']}  R2: {ridge_metrics['R2']}")
 
         all_metrics[stat] = metrics
 

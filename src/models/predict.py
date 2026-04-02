@@ -6,6 +6,7 @@ import unicodedata
 from datetime import datetime, timedelta
 from loguru import logger
 from nba_api.stats.endpoints import playergamelogs, teamgamelogs, scoreboardv3
+import joblib
 import xgboost as xgb
 import sys
 
@@ -31,21 +32,41 @@ from src.features.engineer import (
 # ─────────────────────────────────────────────
 
 def load_models() -> dict:
-    """Load all three trained XGBoost models from disk."""
-    model_files = {
-        "PTS": "pts_model.json",
-        "REB": "reb_model.json",
-        "AST": "ast_model.json",
+    """
+    Load production models. Tries Ridge (.pkl) first; falls back to XGBoost (.json).
+    All three stats must use the same backend -- Ridge is only active when all three
+    pkl files exist.
+    """
+    ridge_files = {
+        "PTS": os.path.join("models", "pts_model_ridge.pkl"),
+        "REB": os.path.join("models", "reb_model_ridge.pkl"),
+        "AST": os.path.join("models", "ast_model_ridge.pkl"),
     }
-    models = {}
-    for stat, filename in model_files.items():
-        path = os.path.join("models", filename)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Model not found: {path}. Run train.py first.")
-        model = xgb.XGBRegressor()
-        model.load_model(path)
-        models[stat] = model
-        logger.info(f"Loaded {stat} model from {path}")
+    xgb_files = {
+        "PTS": os.path.join("models", "pts_model.json"),
+        "REB": os.path.join("models", "reb_model.json"),
+        "AST": os.path.join("models", "ast_model.json"),
+    }
+
+    use_ridge = all(os.path.exists(p) for p in ridge_files.values())
+
+    if use_ridge:
+        logger.info("Using Ridge production models.")
+        models = {}
+        for stat, path in ridge_files.items():
+            models[stat] = joblib.load(path)
+            logger.info(f"Loaded {stat} Ridge model from {path}")
+    else:
+        logger.info("Using XGBoost production models.")
+        models = {}
+        for stat, path in xgb_files.items():
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Model not found: {path}. Run train.py first.")
+            model = xgb.XGBRegressor()
+            model.load_model(path)
+            models[stat] = model
+            logger.info(f"Loaded {stat} XGBoost model from {path}")
+
     return models
 
 
