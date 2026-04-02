@@ -1,0 +1,558 @@
+import pandas as pd
+import numpy as np
+import os
+import json
+import unicodedata
+from datetime import datetime, timedelta
+from loguru import logger
+from nba_api.stats.endpoints import playergamelogs, teamgamelogs, scoreboardv3
+import xgboost as xgb
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+from src.ingestion.roster import get_available_players
+from src.ingestion.injuries import get_unavailable_players
+from src.ingestion.odds import get_vegas_lines
+from src.features.engineer import (
+    prepare_player_df,
+    add_rolling_averages,
+    add_rest_days,
+    add_home_away,
+    add_defensive_strength,
+    add_absence_features,
+    add_foul_features,
+    load_latest_raw,
+)
+
+
+# ─────────────────────────────────────────────
+# Load trained models
+# ─────────────────────────────────────────────
+
+def load_models() -> dict:
+    """Load all three trained XGBoost models from disk."""
+    model_files = {
+        "PTS": "pts_model.json",
+        "REB": "reb_model.json",
+        "AST": "ast_model.json",
+    }
+    models = {}
+    for stat, filename in model_files.items():
+        path = os.path.join("models", filename)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model not found: {path}. Run train.py first.")
+        model = xgb.XGBRegressor()
+        model.load_model(path)
+        models[stat] = model
+        logger.info(f"Loaded {stat} model from {path}")
+    return models
+
+
+def load_quantile_models() -> dict:
+    """
+    Load lower (p10) and upper (p90) quantile models for each stat.
+    Returns a dict keyed by e.g. 'PTS_lower', 'PTS_upper'.
+    Gracefully skips any model file that doesn't exist yet.
+    """
+    quantile_files = {
+        "PTS_lower": "pts_model_lower.json",
+        "PTS_upper": "pts_model_upper.json",
+        "REB_lower": "reb_model_lower.json",
+        "REB_upper": "reb_model_upper.json",
+        "AST_lower": "ast_model_lower.json",
+        "AST_upper": "ast_model_upper.json",
+    }
+    q_models = {}
+    for key, filename in quantile_files.items():
+        path = os.path.join("models", filename)
+        if not os.path.exists(path):
+            logger.warning(f"Quantile model not found (skipping): {path}")
+            continue
+        model = xgb.XGBRegressor()
+        model.load_model(path)
+        q_models[key] = model
+        logger.info(f"Loaded quantile model {key} from {path}")
+    return q_models
+
+
+# ─────────────────────────────────────────────
+# Feature columns — must match train.py exactly
+# ─────────────────────────────────────────────
+
+BASE_FEATURES = [
+    "DAYS_REST", "IS_BACK_TO_BACK", "IS_WELL_RESTED",
+    "IS_HOME", "OPP_PTS_allowed_avg_L10", "OPP_PTS_vs_POSITION_L10",
+    "KEY_TEAMMATE_OUT", "KEY_OPP_OUT",
+    "MIN_avg_L5", "MIN_avg_L10",
+    "TEAM_PACE_L10", "OPP_PACE_L10", "COMBINED_PACE",
+    "GAMES_SINCE_RETURN", "IS_RETURNING", "RETURN_GAME_NUMBER",
+]
+
+STAT_FEATURES = {
+    "PTS": BASE_FEATURES + [
+        "PTS_avg_L5", "PTS_avg_L10", "PTS_avg_L20",
+        "FGA_avg_L5", "FGA_avg_L10",
+        "FG_PCT_avg_L5", "FG_PCT_avg_L10",
+        "FG3A_avg_L5", "FG3_PCT_avg_L5",
+        "FTA_avg_L5", "FT_PCT_avg_L5",
+        "PLUS_MINUS_avg_L5",
+        "PFD_per36_avg_L10", "HIGH_FT_DRAW",
+    ],
+    "REB": BASE_FEATURES + [
+        "REB_avg_L5", "REB_avg_L10", "REB_avg_L20",
+        "OREB_avg_L5", "OREB_avg_L10",
+        "DREB_avg_L5", "DREB_avg_L10",
+        "FGA_avg_L5", "PLUS_MINUS_avg_L5",
+        "PF_per36_avg_L10", "FOUL_TROUBLE_RISK",
+    ],
+    "AST": BASE_FEATURES + [
+        "AST_avg_L5", "AST_avg_L10", "AST_avg_L20",
+        "TOV_avg_L5", "TOV_avg_L10",
+        "PTS_avg_L5", "FGA_avg_L5",
+        "PLUS_MINUS_avg_L5",
+        "PF_per36_avg_L10", "FOUL_TROUBLE_RISK",
+    ],
+}
+
+
+# ─────────────────────────────────────────────
+# Fetch today's games
+# ─────────────────────────────────────────────
+
+def get_todays_games(game_date: str = None) -> pd.DataFrame:
+    """
+    Fetch today's scheduled games from the NBA scoreboard.
+    Returns a DataFrame with home and away team info.
+    game_date format: 'YYYY-MM-DD' — defaults to today.
+    """
+    if game_date is None:
+        game_date = datetime.now().strftime("%Y-%m-%d")
+
+    logger.info(f"Fetching games for {game_date}...")
+
+    try:
+        board = scoreboardv3.ScoreboardV3(game_date=game_date)
+        all_dfs = board.get_data_frames()
+
+        # Log all available dataframes so we can find the right one
+        for i, df in enumerate(all_dfs):
+            logger.info(f"DataFrame[{i}] columns: {list(df.columns)[:6]}... rows: {len(df)}")
+
+        # Find the dataframe that contains team ID columns
+        games_df = None
+        for df in all_dfs:
+            cols = [c.lower() for c in df.columns]
+            if any("teamid" in c or "team_id" in c for c in cols):
+                games_df = df
+                logger.info(f"Found games dataframe with columns: {list(df.columns)}")
+                break
+
+        if games_df is None or games_df.empty:
+            logger.warning(f"No games found for {game_date}.")
+            return pd.DataFrame()
+
+    except Exception as e:
+        logger.error(f"Failed to fetch scoreboard: {e}")
+        raise
+
+    logger.info(f"Found {len(games_df)} games on {game_date}.")
+    return games_df
+
+
+# ─────────────────────────────────────────────
+# Build prediction input for today's players
+# ─────────────────────────────────────────────
+
+def build_prediction_input(game_date: str = None):
+    """
+    Load the full season feature matrix and filter down to players
+    whose teams are playing today.
+    Returns (player_df, playing_team_ids).
+    """
+    if game_date is None:
+        game_date = datetime.now().strftime("%Y-%m-%d")
+
+    features_path = os.path.join("data", "features", "player_features.csv")
+    if not os.path.exists(features_path):
+        raise FileNotFoundError("Feature matrix not found. Run engineer.py first.")
+
+    df = pd.read_csv(features_path)
+    df = df.copy()
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+
+    games_df = get_todays_games(game_date)
+    if games_df.empty:
+        return pd.DataFrame(), set()
+
+    playing_team_ids = set()
+    if "teamId" in games_df.columns:
+        playing_team_ids.update(games_df["teamId"].tolist())
+        logger.info(f"Parsed {len(playing_team_ids)} team IDs from teamId column.")
+    else:
+        logger.warning("Could not parse team IDs - using all teams.")
+        logger.warning(f"Available columns: {list(games_df.columns)}")
+
+    if playing_team_ids:
+        df = df[df["TEAM_ID"].isin(playing_team_ids)]
+
+    latest_per_player = (
+        df.sort_values("GAME_DATE")
+        .groupby("PLAYER_ID")
+        .last()
+        .reset_index()
+        .copy()
+    )
+
+    latest_per_player = latest_per_player.drop(
+        columns=["DAYS_REST", "IS_BACK_TO_BACK", "IS_WELL_RESTED"],
+        errors="ignore"
+    )
+
+    today = pd.Timestamp(game_date)
+    days_rest = ((today - latest_per_player["GAME_DATE"]).dt.days - 1).clip(lower=0, upper=14)
+    latest_per_player["DAYS_REST"] = days_rest
+    latest_per_player["IS_BACK_TO_BACK"] = (days_rest == 0).astype(int)
+    latest_per_player["IS_WELL_RESTED"] = (days_rest >= 3).astype(int)
+    latest_per_player = latest_per_player.copy()
+
+    logger.info(f"Built prediction input for {len(latest_per_player)} players.")
+    return latest_per_player, playing_team_ids
+
+
+###################################################################################
+
+
+def filter_available_players(
+    player_df: pd.DataFrame,
+    team_ids: list,
+    season: str = "2025-26"
+) -> pd.DataFrame:
+    """
+    Filter prediction input to only players who are
+    available to play tonight based on roster and
+    recent activity checks.
+    """
+    if not team_ids:
+        logger.warning("No team IDs provided - skipping availability filter.")
+        return player_df
+
+    available_ids = get_available_players(
+        team_ids=list(team_ids),
+        season=season,
+        n_games=3
+    )
+
+    if not available_ids:
+        logger.warning("Could not determine availability - using full player pool.")
+        return player_df
+
+    before = len(player_df)
+    filtered = player_df[player_df["PLAYER_ID"].isin(available_ids)].copy()
+    removed = before - len(filtered)
+    logger.info(f"Roster/activity filter removed {removed} players - "
+                f"{len(filtered)} remaining.")
+
+    # Injury filter — remove players ruled Out per ESPN injury report
+    try:
+        unavailable = get_unavailable_players()
+        before_injury = len(filtered)
+        filtered = filtered[~filtered["PLAYER_NAME"].isin(unavailable)].copy()
+        injury_removed = before_injury - len(filtered)
+        logger.info(f"Injury filter removed {injury_removed} players (Out) - "
+                    f"{len(filtered)} remaining.")
+    except Exception as e:
+        logger.warning(f"Injury filter skipped (ESPN fetch failed): {e}")
+
+    return filtered
+
+
+# ─────────────────────────────────────────────
+# Generate predictions
+# ─────────────────────────────────────────────
+
+def generate_predictions(models: dict, player_df: pd.DataFrame,
+                         q_models: dict = None) -> pd.DataFrame:
+    """
+    Run each model and attach predictions to the player DataFrame.
+    If q_models is provided, also generates p10/p90 interval bounds.
+    Returns a clean output DataFrame with one row per player.
+    """
+    results = player_df[["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION",
+                          "MATCHUP", "DAYS_REST", "IS_HOME"]].copy().reset_index(drop=True)
+
+    if q_models is None:
+        q_models = {}
+
+    for stat, model in models.items():
+        feature_cols = STAT_FEATURES[stat]
+        available = [f for f in feature_cols if f in player_df.columns]
+        missing = set(feature_cols) - set(available)
+        if missing:
+            logger.warning(f"{stat} missing features: {missing}")
+
+        X = player_df[available].fillna(0).reset_index(drop=True)
+
+        try:
+            preds = model.predict(X).astype(float)
+            results[f"{stat}_PRED"] = np.round(preds, 1)
+        except Exception as e:
+            logger.error(f"Prediction failed for {stat}: {e}")
+            results[f"{stat}_PRED"] = np.nan
+
+        for bound, suffix in [("lower", "LOW"), ("upper", "HIGH")]:
+            key = f"{stat}_{bound}"
+            col = f"{stat}_{suffix}"
+            if key in q_models:
+                try:
+                    q_preds = q_models[key].predict(X).astype(float)
+                    results[col] = np.round(q_preds, 1)
+                except Exception as e:
+                    logger.error(f"Quantile prediction failed for {key}: {e}")
+                    results[col] = np.nan
+            else:
+                results[col] = np.nan
+
+    return results
+
+
+# ─────────────────────────────────────────────
+# Save and display predictions
+# ─────────────────────────────────────────────
+
+def merge_vegas_lines(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fetch Vegas player prop lines and left-join onto the predictions DataFrame.
+    Adds VEGAS_PTS, VEGAS_REB, VEGAS_AST and the three DIFF columns.
+    Players without Vegas lines keep NaN in those columns.
+    """
+    vegas = get_vegas_lines()
+    if vegas.empty:
+        logger.warning("No Vegas lines available -- skipping merge.")
+        for col in ["VEGAS_PTS", "VEGAS_REB", "VEGAS_AST",
+                    "PTS_DIFF", "REB_DIFF", "AST_DIFF"]:
+            results[col] = np.nan
+        return results
+
+    results = results.merge(vegas, on="PLAYER_NAME", how="left")
+
+    results["PTS_DIFF"] = (results["PTS_PRED"] - results["VEGAS_PTS"]).round(1)
+    results["REB_DIFF"] = (results["REB_PRED"] - results["VEGAS_REB"]).round(1)
+    results["AST_DIFF"] = (results["AST_PRED"] - results["VEGAS_AST"]).round(1)
+
+    matched = results["VEGAS_PTS"].notna().sum()
+    logger.info(f"Vegas lines merged: {matched}/{len(results)} players matched.")
+    return results
+
+
+def save_predictions(results: pd.DataFrame, game_date: str):
+    """Save prediction output to data/predictions/"""
+    out_dir = os.path.join("data", "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+
+    filename = f"predictions_{game_date}.csv"
+    filepath = os.path.join(out_dir, filename)
+    results.to_csv(filepath, index=False)
+    logger.info(f"Saved predictions to {filepath}")
+    return filepath
+
+
+def _fmt_diff(val) -> str:
+    """Format a diff value as '+X.X' / '-X.X' / '   -' if NaN."""
+    if pd.isna(val):
+        return "   -"
+    return f"{val:+.1f}"
+
+
+def _fmt_line(val) -> str:
+    """Format a Vegas line, or '-' if NaN."""
+    if pd.isna(val):
+        return "  -"
+    return f"{val:.1f}"
+
+
+def display_predictions(results: pd.DataFrame, min_pts: float = 8.0, game_date: str = None):
+    """
+    Print model vs Vegas comparison table sorted by abs(PTS_DIFF) descending.
+    Only shows players where at least one Vegas line exists.
+    Falls back to a plain predictions table if no Vegas lines were merged.
+    Also prints a high-conviction disagreements section.
+    """
+    display_date = game_date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        formatted_date = datetime.strptime(display_date, "%Y-%m-%d").strftime("%B %d, %Y")
+    except Exception:
+        formatted_date = display_date
+
+    has_vegas = "VEGAS_PTS" in results.columns and results["VEGAS_PTS"].notna().any()
+
+    has_intervals = ("PTS_LOW" in results.columns and results["PTS_LOW"].notna().any())
+
+    def _rng(row, stat):
+        lo = row.get(f"{stat}_LOW")
+        hi = row.get(f"{stat}_HIGH")
+        if pd.isna(lo) or pd.isna(hi):
+            return ""
+        return f"({int(round(lo))}-{int(round(hi))})"
+
+    # ── plain table (no Vegas data) ──────────────────────────────────────
+    if not has_vegas:
+        plain = results[results["PTS_PRED"] >= min_pts].copy()
+        plain = plain.sort_values("PTS_PRED", ascending=False)
+        plain["REST"] = plain["DAYS_REST"].apply(lambda x: "B2B" if x == 0 else f"{int(x)}d")
+        plain["LOC"]  = plain["IS_HOME"].apply(lambda x: "HOME" if x else "AWAY")
+
+        if has_intervals:
+            W = 90
+            print(f"\n{'='*W}")
+            print(f"  NBA Predictions - {formatted_date}")
+            print(f"{'='*W}")
+            print(f"{'Player':<24} {'Team':<5} {'Loc':<5} {'Rest':<5}"
+                  f"  {'PTS (range)':<15} {'REB (range)':<15} {'AST (range)':<15}")
+            print(f"{'-'*W}")
+            for _, row in plain.iterrows():
+                name = unicodedata.normalize("NFKD", str(row["PLAYER_NAME"])).encode("ascii", "ignore").decode("ascii")
+                name = name[:23]
+                pts_str = f"{row['PTS_PRED']:.1f} {_rng(row, 'PTS')}"
+                reb_str = f"{row['REB_PRED']:.1f} {_rng(row, 'REB')}"
+                ast_str = f"{row['AST_PRED']:.1f} {_rng(row, 'AST')}"
+                rest = "B2B" if row["DAYS_REST"] == 0 else f"{int(row['DAYS_REST'])}d"
+                loc  = "HOME" if row["IS_HOME"] else "AWAY"
+                print(f"{name:<24} {str(row['TEAM_ABBREVIATION']):<5} {loc:<5} {rest:<5}"
+                      f"  {pts_str:<15} {reb_str:<15} {ast_str:<15}")
+            print(f"{'='*W}")
+            print(f"  {len(plain)} players | min {min_pts} predicted PTS | range = p10-p90")
+            print(f"{'='*W}\n")
+        else:
+            print(f"\n{'='*72}")
+            print(f"  NBA Predictions - {formatted_date}")
+            print(f"{'='*72}")
+            print(f"{'Player':<25} {'Team':<5} {'Matchup':<14} {'Loc':<5} "
+                  f"{'Rest':<5} {'PTS':>5} {'REB':>5} {'AST':>5}")
+            print(f"{'-'*72}")
+            for _, row in plain.iterrows():
+                matchup = str(row["MATCHUP"])
+                matchup = matchup[-13:] if len(matchup) > 13 else matchup
+                name = unicodedata.normalize("NFKD", str(row["PLAYER_NAME"])).encode("ascii", "ignore").decode("ascii")
+                print(f"{name:<25} {str(row['TEAM_ABBREVIATION']):<5} {matchup:<14} "
+                      f"{row['LOC']:<5} {row['REST']:<5} "
+                      f"{row['PTS_PRED']:>5} {row['REB_PRED']:>5} {row['AST_PRED']:>5}")
+            print(f"{'='*72}")
+            print(f"  {len(plain)} players | min {min_pts} predicted PTS")
+            print(f"{'='*72}\n")
+        return
+
+    # ── Vegas comparison table ────────────────────────────────────────────
+    # Only rows with at least one Vegas line
+    df = results[results["VEGAS_PTS"].notna() | results["VEGAS_REB"].notna()].copy()
+    df = df[df["PTS_PRED"] >= min_pts].copy()
+
+    # Sort by abs PTS_DIFF descending; NaN diffs go to the bottom
+    df["_abs_diff"] = df["PTS_DIFF"].abs().fillna(-1)
+    df = df.sort_values("_abs_diff", ascending=False).drop(columns=["_abs_diff"])
+
+    W = 100 if has_intervals else 88
+    print(f"\n{'='*W}")
+    print(f"  NBA Predictions vs Vegas - {formatted_date}")
+    print(f"{'='*W}")
+    if has_intervals:
+        print(
+            f"{'Player':<24} {'Team':<5}"
+            f" {'PTS (range)':<16} {'PTS_Vegas':>9} {'PTS_Diff':>8}"
+            f" {'REB (range)':<16} {'REB_Vegas':>9} {'REB_Diff':>8}"
+            f"  {'Flg'}"
+        )
+    else:
+        print(
+            f"{'Player':<24} {'Team':<5}"
+            f" {'PTS_Pred':>8} {'PTS_Vegas':>9} {'PTS_Diff':>8}"
+            f" {'REB_Pred':>8} {'REB_Vegas':>9} {'REB_Diff':>8}"
+            f"  {'Flag'}"
+        )
+    print(f"{'-'*W}")
+
+    for _, row in df.iterrows():
+        name = unicodedata.normalize("NFKD", str(row["PLAYER_NAME"])).encode("ascii", "ignore").decode("ascii")
+        name = name[:23]
+        flag = "*" if (not pd.isna(row.get("PTS_DIFF")) and abs(row["PTS_DIFF"]) > 3.0) else " "
+        if has_intervals:
+            pts_str = f"{row['PTS_PRED']:.1f} {_rng(row, 'PTS')}"
+            reb_str = f"{row['REB_PRED']:.1f} {_rng(row, 'REB')}"
+            print(
+                f"{name:<24} {str(row['TEAM_ABBREVIATION']):<5}"
+                f" {pts_str:<16} {_fmt_line(row['VEGAS_PTS']):>9} {_fmt_diff(row['PTS_DIFF']):>8}"
+                f" {reb_str:<16} {_fmt_line(row['VEGAS_REB']):>9} {_fmt_diff(row['REB_DIFF']):>8}"
+                f"  {flag}"
+            )
+        else:
+            print(
+                f"{name:<24} {str(row['TEAM_ABBREVIATION']):<5}"
+                f" {row['PTS_PRED']:>8.1f} {_fmt_line(row['VEGAS_PTS']):>9} {_fmt_diff(row['PTS_DIFF']):>8}"
+                f" {row['REB_PRED']:>8.1f} {_fmt_line(row['VEGAS_REB']):>9} {_fmt_diff(row['REB_DIFF']):>8}"
+                f"  {flag}"
+            )
+
+    print(f"{'='*W}")
+    print(f"  {len(df)} players with Vegas lines | min {min_pts} predicted PTS | * = |PTS diff| > 3.0")
+    if has_intervals:
+        print(f"  range = p10-p90 interval")
+    print(f"{'='*W}\n")
+
+    # ── High-conviction disagreements ─────────────────────────────────────
+    big = df[df["PTS_DIFF"].abs() > 3.0].copy()
+    if big.empty:
+        return
+
+    higher = big[big["PTS_DIFF"] > 0].sort_values("PTS_DIFF", ascending=False)
+    lower  = big[big["PTS_DIFF"] < 0].sort_values("PTS_DIFF")
+
+    print(f"{'='*W}")
+    print(f"  High-conviction disagreements (|PTS diff| > 3.0)")
+    print(f"{'='*W}")
+
+    if not higher.empty:
+        print("  Model HIGHER than Vegas (potential undervalued):")
+        for _, row in higher.iterrows():
+            name = unicodedata.normalize("NFKD", str(row["PLAYER_NAME"])).encode("ascii", "ignore").decode("ascii")
+            print(f"    {name}: model {row['PTS_PRED']:.1f} vs Vegas {row['VEGAS_PTS']:.1f} ({row['PTS_DIFF']:+.1f})")
+
+    if not lower.empty:
+        print("  Model LOWER than Vegas (potential overvalued):")
+        for _, row in lower.iterrows():
+            name = unicodedata.normalize("NFKD", str(row["PLAYER_NAME"])).encode("ascii", "ignore").decode("ascii")
+            print(f"    {name}: model {row['PTS_PRED']:.1f} vs Vegas {row['VEGAS_PTS']:.1f} ({row['PTS_DIFF']:+.1f})")
+
+    print(f"{'='*W}\n")
+
+
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    game_date = sys.argv[1] if len(sys.argv) > 1 else None
+    season = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
+
+    models   = load_models()
+    q_models = load_quantile_models()
+    player_df, playing_team_ids = build_prediction_input(game_date=game_date)
+
+    if player_df.empty:
+        logger.warning("No players to predict for. Check if there are games today.")
+    else:
+        player_df = filter_available_players(
+            player_df,
+            team_ids=playing_team_ids,
+            season=season
+        )
+
+        if player_df.empty:
+            logger.warning("No available players after filtering.")
+        else:
+            results = generate_predictions(models, player_df, q_models=q_models)
+            results = merge_vegas_lines(results)
+            date_str = game_date or datetime.now().strftime("%Y-%m-%d")
+            save_predictions(results, date_str)
+            display_predictions(results, min_pts=8.0, game_date=date_str)

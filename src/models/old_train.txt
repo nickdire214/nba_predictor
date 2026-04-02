@@ -1,0 +1,169 @@
+# import pandas as pd
+# import numpy as np
+# import os
+# import json
+# from loguru import logger
+# from sklearn.model_selection import train_test_split
+# from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+# import xgboost as xgb
+
+
+# # ─────────────────────────────────────────────
+# # Features the model will train on
+# # ─────────────────────────────────────────────
+
+# FEATURE_COLS = [
+#     # Rolling averages — recent form
+#     "PTS_avg_L5", "PTS_avg_L10", "PTS_avg_L20",
+#     "FGA_avg_L5", "FGA_avg_L10",
+#     "FG_PCT_avg_L5", "FG_PCT_avg_L10",
+#     "FG3A_avg_L5", "FG3_PCT_avg_L5",
+#     "FTA_avg_L5", "FT_PCT_avg_L5",
+#     "MIN_avg_L5", "MIN_avg_L10",
+#     "PLUS_MINUS_avg_L5",
+
+#     # Rest and fatigue
+#     "DAYS_REST",
+#     "IS_BACK_TO_BACK",
+#     "IS_WELL_RESTED",
+
+#     # Location
+#     "IS_HOME",
+
+#     # Opponent defense
+#     "OPP_PTS_allowed_avg_L10",
+
+#     # Absence flags
+#     "KEY_TEAMMATE_OUT",
+#     "KEY_OPP_OUT",
+# ]
+
+# TARGET_COL = "PTS"
+
+
+# def load_features() -> pd.DataFrame:
+#     """Load the engineered feature matrix."""
+#     path = os.path.join("data", "features", "player_features.csv")
+#     if not os.path.exists(path):
+#         raise FileNotFoundError("Feature matrix not found. Run engineer.py first.")
+#     df = pd.read_csv(path)
+#     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+#     logger.info(f"Loaded feature matrix: {df.shape}")
+#     return df
+
+
+# def split_data(df: pd.DataFrame):
+#     """
+#     Time-aware train/test split.
+#     Train on the first 80% of the season chronologically,
+#     test on the most recent 20%.
+#     This prevents the model from 'seeing the future'.
+#     """
+#     df = df.sort_values("GAME_DATE").reset_index(drop=True)
+#     split_idx = int(len(df) * 0.80)
+
+#     train_df = df.iloc[:split_idx]
+#     test_df = df.iloc[split_idx:]
+
+#     logger.info(f"Train: {len(train_df):,} rows | Test: {len(test_df):,} rows")
+#     logger.info(f"Train dates: {train_df['GAME_DATE'].min().date()} → {train_df['GAME_DATE'].max().date()}")
+#     logger.info(f"Test dates:  {test_df['GAME_DATE'].min().date()} → {test_df['GAME_DATE'].max().date()}")
+
+#     return train_df, test_df
+
+
+# def prepare_xy(df: pd.DataFrame):
+#     """Extract feature matrix X and target y, dropping rows with NaN features."""
+#     available_features = [f for f in FEATURE_COLS if f in df.columns]
+#     missing = set(FEATURE_COLS) - set(available_features)
+#     if missing:
+#         logger.warning(f"Missing feature columns: {missing}")
+
+#     subset = df[available_features + [TARGET_COL]].dropna()
+#     X = subset[available_features]
+#     y = subset[TARGET_COL]
+#     return X, y
+
+
+# def train_model(X_train, y_train) -> xgb.XGBRegressor:
+#     """Train an XGBoost regressor."""
+#     model = xgb.XGBRegressor(
+#         n_estimators=400,
+#         learning_rate=0.05,
+#         max_depth=5,
+#         subsample=0.8,
+#         colsample_bytree=0.8,
+#         min_child_weight=3,
+#         random_state=42,
+#         n_jobs=-1,
+#         verbosity=0,
+#     )
+#     logger.info("Training XGBoost model...")
+#     model.fit(X_train, y_train)
+#     logger.info("Training complete.")
+#     return model
+
+
+# def evaluate_model(model, X_test, y_test) -> dict:
+#     """Evaluate model on test set and return metrics."""
+#     preds = model.predict(X_test)
+
+#     mae  = mean_absolute_error(y_test, preds)
+#     rmse = mean_squared_error(y_test, preds) ** 0.5
+#     r2   = r2_score(y_test, preds)
+
+#     metrics = {"MAE": round(mae, 3), "RMSE": round(rmse, 3), "R2": round(r2, 3)}
+
+#     logger.info(f"MAE:  {mae:.2f} points  ← average prediction error")
+#     logger.info(f"RMSE: {rmse:.2f} points")
+#     logger.info(f"R²:   {r2:.3f}          ← 1.0 = perfect, 0.0 = no better than mean")
+
+#     return metrics, preds
+
+
+# def save_model(model, metrics: dict):
+#     """Save model and metrics to models/ directory."""
+#     os.makedirs("models", exist_ok=True)
+#     model_path = os.path.join("models", "pts_model.json")
+#     metrics_path = os.path.join("models", "pts_model_metrics.json")
+
+#     model.save_model(model_path)
+#     with open(metrics_path, "w") as f:
+#         json.dump(metrics, f, indent=2)
+
+#     logger.info(f"Model saved to {model_path}")
+#     logger.info(f"Metrics saved to {metrics_path}")
+
+
+# def show_feature_importance(model, feature_names: list):
+#     """Print top 10 most important features."""
+#     importance = pd.Series(
+#         model.feature_importances_,
+#         index=feature_names
+#     ).sort_values(ascending=False)
+
+#     print("\n--- Top 10 feature importances ---")
+#     print(importance.head(10).to_string())
+
+
+# if __name__ == "__main__":
+#     df = load_features()
+#     train_df, test_df = split_data(df)
+
+#     X_train, y_train = prepare_xy(train_df)
+#     X_test, y_test = prepare_xy(test_df)
+
+#     model = train_model(X_train, y_train)
+#     metrics, preds = evaluate_model(model, X_test, y_test)
+#     save_model(model, metrics)
+
+#     show_feature_importance(model, X_train.columns.tolist())
+
+#     # Sample predictions vs actuals
+#     results = test_df.loc[y_test.index, ["PLAYER_NAME", "GAME_DATE", "PTS"]].copy()
+#     results["PTS_PREDICTED"] = preds.round(1)
+#     results["ERROR"] = (results["PTS_PREDICTED"] - results["PTS"]).abs().round(1)
+#     print(f"\n--- Sample predictions vs actuals ---")
+#     print(results[["PLAYER_NAME", "GAME_DATE", "PTS",
+#                    "PTS_PREDICTED", "ERROR"]].head(15).to_string())
+    

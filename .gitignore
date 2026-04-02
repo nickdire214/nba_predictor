@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/raw/
+data/features/
+data/predictions/
+logs/
+*.log
+*.pkl
+models/*.json
+
+catboost_info/
+
+.claude/
