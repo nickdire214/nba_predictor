@@ -338,6 +338,36 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────
+# Calibration
+# ─────────────────────────────────────────────
+
+# Bias measured from 2026-04-02 post-game evaluation (clean set, outliers removed)
+_CALIBRATION = {
+    "PTS": 2.00,
+    "REB": 0.63,
+    "AST": 0.56,
+}
+
+
+def apply_calibration(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    Subtract known positive bias from predictions and quantile bounds.
+    Clips all values to a minimum of 0.0 to avoid negative predictions.
+    """
+    logger.info(
+        f"Applying calibration: PTS -{_CALIBRATION['PTS']:.2f}, "
+        f"REB -{_CALIBRATION['REB']:.2f}, "
+        f"AST -{_CALIBRATION['AST']:.2f}"
+    )
+    results = results.copy()
+    for stat, offset in _CALIBRATION.items():
+        for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
+            if col in results.columns:
+                results[col] = (results[col] - offset).clip(lower=0.0).round(1)
+    return results
+
+
+# ─────────────────────────────────────────────
 # Save and display predictions
 # ─────────────────────────────────────────────
 
@@ -573,6 +603,7 @@ if __name__ == "__main__":
             logger.warning("No available players after filtering.")
         else:
             results = generate_predictions(models, player_df, q_models=q_models)
+            results = apply_calibration(results)
             results = merge_vegas_lines(results)
             date_str = game_date or datetime.now().strftime("%Y-%m-%d")
             save_predictions(results, date_str)
