@@ -1,9 +1,10 @@
-from datetime import datetime, timedelta
+import os
+from datetime import date, datetime, timedelta
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.sensors.python import PythonSensor
 import sys
-import os
 
 sys.path.insert(0, "/opt/airflow")
 
@@ -12,6 +13,9 @@ from src.models.predict import (
     build_prediction_input,
     filter_available_players,
     generate_predictions,
+    apply_calibration,
+    load_quantile_models,
+    merge_vegas_lines,
     save_predictions,
 )
 
@@ -23,12 +27,24 @@ default_args = {
 }
 
 
+def features_file_ready() -> bool:
+    """
+    Return True if data/features/player_features.csv was written today.
+    """
+    path  = "/opt/airflow/data/features/player_features.csv"
+    today = date.today()
+    if not os.path.exists(path):
+        return False
+    return date.fromtimestamp(os.path.getmtime(path)) == today
+
+
 def run_predictions():
     """Full prediction pipeline task."""
     game_date = datetime.now().strftime("%Y-%m-%d")
-    season = "2025-26"
+    season    = "2025-26"
 
-    models = load_models()
+    models   = load_models()
+    q_models = load_quantile_models()
     player_df, playing_team_ids = build_prediction_input(game_date=game_date)
 
     if player_df.empty:
@@ -38,14 +54,16 @@ def run_predictions():
     player_df = filter_available_players(
         player_df,
         team_ids=playing_team_ids,
-        season=season
+        season=season,
     )
 
     if player_df.empty:
         print("No available players after filtering.")
         return
 
-    results = generate_predictions(models, player_df)
+    results = generate_predictions(models, player_df, q_models=q_models)
+    results = apply_calibration(results)
+    results = merge_vegas_lines(results)
     save_predictions(results, game_date)
     print(f"Saved predictions for {game_date} - {len(results)} players.")
 
@@ -61,12 +79,9 @@ with DAG(
     tags=["nba", "predictions"],
 ) as dag:
 
-    wait_for_features = ExternalTaskSensor(
+    wait_for_features = PythonSensor(
         task_id="wait_for_features",
-        external_dag_id="nba_features_daily",
-        external_task_id="build_player_features",
-        execution_delta=None,
-        execution_date_fn=None,
+        python_callable=features_file_ready,
         timeout=3600,
         poke_interval=30,
         mode="poke",

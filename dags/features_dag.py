@@ -1,7 +1,10 @@
-from datetime import datetime, timedelta
+import glob
+import os
+from datetime import date, datetime, timedelta
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.sensors.python import PythonSensor
 import sys
 
 sys.path.insert(0, "/opt/airflow")
@@ -15,6 +18,20 @@ default_args = {
     "email_on_failure": False,
 }
 
+
+def ingest_file_ready() -> bool:
+    """
+    Return True if any player_gamelogs_2025_26_*.csv in data/raw/
+    was written today (mtime == today's date).
+    """
+    pattern = "/opt/airflow/data/raw/player_gamelogs_2025_26_*.csv"
+    today   = date.today()
+    for path in glob.glob(pattern):
+        if date.fromtimestamp(os.path.getmtime(path)) == today:
+            return True
+    return False
+
+
 with DAG(
     dag_id="nba_features_daily",
     description="Engineer features from raw NBA game logs",
@@ -26,12 +43,9 @@ with DAG(
     tags=["nba", "features"],
 ) as dag:
 
-    wait_for_ingest = ExternalTaskSensor(
+    wait_for_ingest = PythonSensor(
         task_id="wait_for_ingest",
-        external_dag_id="nba_ingest_daily",
-        external_task_id="ingest_team_logs",
-        execution_delta=None,
-        execution_date_fn=None,
+        python_callable=ingest_file_ready,
         timeout=3600,
         poke_interval=30,
         mode="poke",

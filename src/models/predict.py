@@ -173,11 +173,22 @@ def get_todays_games(game_date: str = None) -> pd.DataFrame:
             logger.warning(f"No games found for {game_date}.")
             return pd.DataFrame()
 
+        # Enrich with home/away info from gameCode (format: YYYYMMDD/AWAYHHOME)
+        # e.g. "20260406/NYKATL" -> away=NYK, home=ATL
+        for df in all_dfs:
+            if "gameCode" in df.columns and "gameId" in df.columns:
+                meta = df[["gameId", "gameCode"]].copy()
+                meta["away_tri"] = meta["gameCode"].str.split("/").str[1].str[:3]
+                meta["home_tri"] = meta["gameCode"].str.split("/").str[1].str[3:]
+                games_df = games_df.merge(meta, on="gameId", how="left")
+                logger.info("Enriched games_df with home/away tricode from gameCode.")
+                break
+
     except Exception as e:
         logger.error(f"Failed to fetch scoreboard: {e}")
         raise
 
-    logger.info(f"Found {len(games_df)} games on {game_date}.")
+    logger.info(f"Found {len(games_df)} team rows on {game_date}.")
     return games_df
 
 
@@ -235,8 +246,30 @@ def build_prediction_input(game_date: str = None):
     latest_per_player["DAYS_REST"] = days_rest
     latest_per_player["IS_BACK_TO_BACK"] = (days_rest == 0).astype(int)
     latest_per_player["IS_WELL_RESTED"] = (days_rest >= 3).astype(int)
-    latest_per_player = latest_per_player.copy()
 
+    # Overwrite MATCHUP and IS_HOME with tonight's actual game data
+    if "away_tri" in games_df.columns and "home_tri" in games_df.columns:
+        matchup_map = {}
+        is_home_map = {}
+        for _, row in games_df.iterrows():
+            tid = row["teamId"]
+            if row["teamTricode"] == row["home_tri"]:
+                matchup_map[tid] = f"{row['teamTricode']} vs. {row['away_tri']}"
+                is_home_map[tid] = 1
+            else:
+                matchup_map[tid] = f"{row['teamTricode']} @ {row['home_tri']}"
+                is_home_map[tid] = 0
+        latest_per_player["MATCHUP"] = (
+            latest_per_player["TEAM_ID"].map(matchup_map)
+            .fillna(latest_per_player["MATCHUP"])
+        )
+        latest_per_player["IS_HOME"] = (
+            latest_per_player["TEAM_ID"].map(is_home_map)
+            .fillna(latest_per_player["IS_HOME"])
+        ).astype(int)
+        logger.info("Overwrote MATCHUP and IS_HOME with tonight's actual game data.")
+
+    latest_per_player = latest_per_player.copy()
     logger.info(f"Built prediction input for {len(latest_per_player)} players.")
     return latest_per_player, playing_team_ids
 
@@ -341,11 +374,14 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
 # Calibration
 # ─────────────────────────────────────────────
 
-# Bias measured from 2026-04-02 post-game evaluation (clean set, outliers removed)
+# Calibration offsets derived from two evaluation days (2026-04-02 and 2026-04-06).
+# Apr-02 uncalibrated bias: PTS +2.00 | Apr-06 with -2.00 calibration: PTS -1.32 -> midpoint ~0.80
+# REB: Apr-02 +0.63, Apr-06 -0.43 -> midpoint ~0.20
+# AST: Apr-02 +0.56, Apr-06 -0.79 -> small positive net -> 0.10
 _CALIBRATION = {
-    "PTS": 2.00,
-    "REB": 0.63,
-    "AST": 0.56,
+    "PTS": 0.80,
+    "REB": 0.20,
+    "AST": 0.10,
 }
 
 
