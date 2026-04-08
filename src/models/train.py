@@ -23,6 +23,8 @@ BASE_FEATURES = [
     "IS_HOME",
     "OPP_PTS_allowed_avg_L10",
     "OPP_PTS_vs_POSITION_L10",
+    "TEAMMATE_USAGE_ABSORBED",
+    "TEAMMATES_OUT_COUNT",
     "KEY_TEAMMATE_OUT",
     "KEY_OPP_OUT",
     "MIN_avg_L5",

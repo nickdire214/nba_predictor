@@ -455,12 +455,22 @@ def add_return_from_injury_features(df: pd.DataFrame, return_window: int = 1) ->
 
 def add_absence_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Flag games where a key teammate or opponent star was absent.
-    Vectorized approach — no row-by-row apply.
+    Add teammate usage absorption and opponent absence features.
+
+    KEY_TEAMMATE_OUT (binary) is replaced with:
+      TEAMMATE_USAGE_ABSORBED -- estimated extra PTS this player absorbs
+                                 when key teammates are missing, based on
+                                 their proportional share of team scoring
+      TEAMMATES_OUT_COUNT     -- how many key teammates (top-20% avg PTS)
+                                 are absent from this game
+
+    KEY_OPP_OUT (binary) is unchanged.
+
+    Vectorized — no row-by-row apply.
     """
     logger.info("Adding absence features...")
 
-    # Define key players — top 20% by season avg PTS
+    # ── Key player threshold (top 20% by season avg PTS) ─────────────────────
     avg_pts = (
         df.groupby("PLAYER_ID")["PTS"]
         .mean()
@@ -468,19 +478,25 @@ def add_absence_features(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"PTS": "SEASON_AVG_PTS"})
     )
     threshold = avg_pts["SEASON_AVG_PTS"].quantile(0.80)
-    key_players = set(avg_pts[avg_pts["SEASON_AVG_PTS"] >= threshold]["PLAYER_ID"])
-    logger.info(f"Key player threshold: {threshold:.1f} avg PTS — {len(key_players)} players qualify.")
+    key_player_set = set(avg_pts[avg_pts["SEASON_AVG_PTS"] >= threshold]["PLAYER_ID"])
+    logger.info(
+        f"Key player threshold: {threshold:.1f} avg PTS "
+        f"— {len(key_player_set)} players qualify."
+    )
 
-    # Count how many key players appeared in each (GAME_ID, TEAM_ID) combo
-    key_df = df[df["PLAYER_ID"].isin(key_players)].copy()
+    # ── Per-game rolling PTS_avg_L10 for each player (already computed) ───────
+    # Use shift(1) value already in df; fill missing with season avg
+    df = df.merge(avg_pts, on="PLAYER_ID", how="left")
+    pts_l10 = df["PTS_avg_L10"].fillna(df["SEASON_AVG_PTS"]).fillna(0)
+
+    # ── Count key players active per (GAME_ID, TEAM_ID) ─────────────────────
+    key_df = df[df["PLAYER_ID"].isin(key_player_set)].copy()
     key_counts = (
         key_df.groupby(["GAME_ID", "TEAM_ID"])["PLAYER_ID"]
         .nunique()
         .reset_index()
         .rename(columns={"PLAYER_ID": "KEY_PLAYERS_ACTIVE"})
     )
-
-    # Max key players ever active for each team across the season
     max_key = (
         key_counts.groupby("TEAM_ID")["KEY_PLAYERS_ACTIVE"]
         .max()
@@ -488,40 +504,142 @@ def add_absence_features(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"KEY_PLAYERS_ACTIVE": "MAX_KEY_PLAYERS"})
     )
     key_counts = key_counts.merge(max_key, on="TEAM_ID")
+    key_counts["TEAMMATES_OUT_COUNT"] = (
+        key_counts["MAX_KEY_PLAYERS"] - key_counts["KEY_PLAYERS_ACTIVE"]
+    ).clip(lower=0)
 
-    # A key teammate is out if active count is below the team's max
-    key_counts["KEY_TEAMMATE_OUT"] = (
-        key_counts["KEY_PLAYERS_ACTIVE"] < key_counts["MAX_KEY_PLAYERS"]
+    # ── Sum of missing key teammates' avg PTS per (GAME_ID, TEAM_ID) ─────────
+    # Active key players in each game
+    active_key = key_df[["GAME_ID", "TEAM_ID", "PLAYER_ID"]].copy()
+    active_key = active_key.merge(
+        df[["PLAYER_ID", "GAME_ID", "PTS_avg_L10", "SEASON_AVG_PTS"]],
+        on=["PLAYER_ID", "GAME_ID"],
+        how="left",
+    )
+    active_key["PTS_L10"] = (
+        active_key["PTS_avg_L10"].fillna(active_key["SEASON_AVG_PTS"]).fillna(0)
+    )
+    # All key players' avg PTS summed per team (season-level expected pool)
+    key_total_pts = (
+        avg_pts[avg_pts["PLAYER_ID"].isin(key_player_set)]
+        .merge(
+            df[["PLAYER_ID", "TEAM_ID"]].drop_duplicates("PLAYER_ID"),
+            on="PLAYER_ID",
+            how="left",
+        )
+        .groupby("TEAM_ID")["SEASON_AVG_PTS"]
+        .sum()
+        .reset_index()
+        .rename(columns={"SEASON_AVG_PTS": "TEAM_KEY_PTS_POOL"})
+    )
+    # PTS from active key players in each game
+    active_sum = (
+        active_key.groupby(["GAME_ID", "TEAM_ID"])["PTS_L10"]
+        .sum()
+        .reset_index()
+        .rename(columns={"PTS_L10": "ACTIVE_KEY_PTS"})
+    )
+    key_counts = (
+        key_counts
+        .merge(active_sum, on=["GAME_ID", "TEAM_ID"], how="left")
+        .merge(key_total_pts, on="TEAM_ID", how="left")
+    )
+    key_counts["ACTIVE_KEY_PTS"] = key_counts["ACTIVE_KEY_PTS"].fillna(0)
+    key_counts["TEAM_KEY_PTS_POOL"] = key_counts["TEAM_KEY_PTS_POOL"].fillna(0)
+    # Missing PTS = pool minus active; 0 when no one is missing
+    key_counts["MISSING_KEY_PTS"] = (
+        key_counts["TEAM_KEY_PTS_POOL"] - key_counts["ACTIVE_KEY_PTS"]
+    ).clip(lower=0)
+
+    # ── Join onto player df to compute per-player usage share ────────────────
+    df = df.merge(
+        key_counts[["GAME_ID", "TEAM_ID", "TEAMMATES_OUT_COUNT", "MISSING_KEY_PTS"]],
+        on=["GAME_ID", "TEAM_ID"],
+        how="left",
+    )
+    df["TEAMMATES_OUT_COUNT"] = df["TEAMMATES_OUT_COUNT"].fillna(0)
+    df["MISSING_KEY_PTS"]     = df["MISSING_KEY_PTS"].fillna(0)
+
+    # Each player's share of their team's available (non-key) scoring
+    # Sum of PTS_avg_L10 for all non-missing players per game/team
+    all_avail_pts = (
+        df.assign(PTS_L10_fill=pts_l10)
+        .groupby(["GAME_ID", "TEAM_ID"])["PTS_L10_fill"]
+        .sum()
+        .reset_index()
+        .rename(columns={"PTS_L10_fill": "TEAM_AVAIL_PTS_SUM"})
+    )
+    df = df.merge(all_avail_pts, on=["GAME_ID", "TEAM_ID"], how="left")
+    df["TEAM_AVAIL_PTS_SUM"] = df["TEAM_AVAIL_PTS_SUM"].replace(0, np.nan)
+
+    # Player scoring share * missing PTS = estimated extra usage
+    player_share = pts_l10 / df["TEAM_AVAIL_PTS_SUM"]
+    df["TEAMMATE_USAGE_ABSORBED"] = (
+        (player_share * df["MISSING_KEY_PTS"]).fillna(0).round(2)
+    )
+
+    # ── Star-level teammate absence (20+ PTS_avg_L10) ────────────────────────
+    # Higher threshold than the general key player pool — true star absences only
+    STAR_THRESHOLD = 20.0
+    star_player_set = set(avg_pts[avg_pts["SEASON_AVG_PTS"] >= STAR_THRESHOLD]["PLAYER_ID"])
+    logger.info(
+        f"Star player threshold: {STAR_THRESHOLD:.0f} avg PTS "
+        f"— {len(star_player_set)} players qualify."
+    )
+    star_df = df[df["PLAYER_ID"].isin(star_player_set)].copy()
+    star_active = (
+        star_df.groupby(["GAME_ID", "TEAM_ID"])["PLAYER_ID"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"PLAYER_ID": "STARS_ACTIVE"})
+    )
+    max_stars = (
+        star_active.groupby("TEAM_ID")["STARS_ACTIVE"]
+        .max()
+        .reset_index()
+        .rename(columns={"STARS_ACTIVE": "MAX_STARS"})
+    )
+    star_counts = star_active.merge(max_stars, on="TEAM_ID")
+    star_counts["KEY_TEAMMATE_OUT"] = (
+        star_counts["STARS_ACTIVE"] < star_counts["MAX_STARS"]
     ).astype(int)
 
-    # Parse opponent team ID from MATCHUP
+    df = df.merge(
+        star_counts[["GAME_ID", "TEAM_ID", "KEY_TEAMMATE_OUT"]],
+        on=["GAME_ID", "TEAM_ID"],
+        how="left",
+    )
+    # Teams with no stars: flag stays 0 (no star ever present to be absent)
+    df["KEY_TEAMMATE_OUT"] = df["KEY_TEAMMATE_OUT"].fillna(0).astype(int)
+
+    # ── Opponent absence (KEY_OPP_OUT unchanged — binary flag) ───────────────
     df["OPP_ABBREVIATION"] = df["MATCHUP"].apply(
         lambda m: m.split("vs. ")[-1].strip() if "vs." in m else m.split("@ ")[-1].strip()
     )
     team_id_lookup = dict(zip(df["TEAM_ABBREVIATION"], df["TEAM_ID"]))
     df["OPP_TEAM_ID"] = df["OPP_ABBREVIATION"].map(team_id_lookup)
 
-    # Join teammate absence onto player df
-    df = df.merge(
-        key_counts[["GAME_ID", "TEAM_ID", "KEY_TEAMMATE_OUT"]],
-        on=["GAME_ID", "TEAM_ID"],
-        how="left"
+    opp_out = key_counts[["GAME_ID", "TEAM_ID", "TEAMMATES_OUT_COUNT"]].rename(
+        columns={"TEAM_ID": "OPP_TEAM_ID", "TEAMMATES_OUT_COUNT": "_OPP_OUT_COUNT"}
+    )
+    df = df.merge(opp_out, on=["GAME_ID", "OPP_TEAM_ID"], how="left")
+    df["KEY_OPP_OUT"] = (df["_OPP_OUT_COUNT"].fillna(0) > 0).astype(int)
+
+    # ── Clean up helper columns ───────────────────────────────────────────────
+    df = df.drop(
+        columns=["OPP_ABBREVIATION", "OPP_TEAM_ID", "MISSING_KEY_PTS",
+                 "TEAM_AVAIL_PTS_SUM", "SEASON_AVG_PTS", "_OPP_OUT_COUNT"],
+        errors="ignore",
     )
 
-    # Join opponent absence — same key_counts but joined on OPP_TEAM_ID
-    opp_counts = key_counts[["GAME_ID", "TEAM_ID", "KEY_TEAMMATE_OUT"]].rename(
-        columns={"TEAM_ID": "OPP_TEAM_ID", "KEY_TEAMMATE_OUT": "KEY_OPP_OUT"}
+    n_absorbed  = int((df["TEAMMATE_USAGE_ABSORBED"] > 0).sum())
+    n_star_out  = int(df["KEY_TEAMMATE_OUT"].sum())
+    logger.info(
+        f"Added TEAMMATE_USAGE_ABSORBED, TEAMMATES_OUT_COUNT, "
+        f"KEY_TEAMMATE_OUT, KEY_OPP_OUT. "
+        f"{n_absorbed:,} player-games with absorbed usage; "
+        f"{n_star_out:,} with a star teammate absent."
     )
-    df = df.merge(opp_counts, on=["GAME_ID", "OPP_TEAM_ID"], how="left")
-
-    # Fill any nulls (teams with no key players registered)
-    df["KEY_TEAMMATE_OUT"] = df["KEY_TEAMMATE_OUT"].fillna(0).astype(int)
-    df["KEY_OPP_OUT"] = df["KEY_OPP_OUT"].fillna(0).astype(int)
-
-    # Clean up helper columns
-    df = df.drop(columns=["OPP_ABBREVIATION", "OPP_TEAM_ID"], errors="ignore")
-
-    logger.info("Added KEY_TEAMMATE_OUT, KEY_OPP_OUT.")
     return df
 
 # ─────────────────────────────────────────────
