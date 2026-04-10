@@ -374,14 +374,12 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
 # Calibration
 # ─────────────────────────────────────────────
 
-# Calibration offsets derived from two evaluation days (2026-04-02 and 2026-04-06).
-# Apr-02 uncalibrated bias: PTS +2.00 | Apr-06 with -2.00 calibration: PTS -1.32 -> midpoint ~0.80
-# REB: Apr-02 +0.63, Apr-06 -0.43 -> midpoint ~0.20
-# AST: Apr-02 +0.56, Apr-06 -0.79 -> small positive net -> 0.10
+# Calibration offsets derived from five evaluation days.
+# Avg bias with -0.80 calibration was -0.28, so true over-prediction ~+0.52 -> use 0.50.
 _CALIBRATION = {
-    "PTS": 0.80,
-    "REB": 0.20,
-    "AST": 0.10,
+    "PTS": 0.50,
+    "REB": 0.10,
+    "AST": 0.05,
 }
 
 
