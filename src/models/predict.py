@@ -387,8 +387,8 @@ _CALIBRATION = {
 
 def apply_calibration(results: pd.DataFrame) -> pd.DataFrame:
     """
-    Subtract known positive bias from predictions and quantile bounds.
-    Clips all values to a minimum of 0.0 to avoid negative predictions.
+    Subtract known positive bias from predictions and quantile bounds,
+    then clip each prediction to stay within its own p10-p90 interval.
     """
     logger.info(
         f"Applying calibration: PTS -{_CALIBRATION['PTS']:.2f}, "
@@ -396,10 +396,34 @@ def apply_calibration(results: pd.DataFrame) -> pd.DataFrame:
         f"AST -{_CALIBRATION['AST']:.2f}"
     )
     results = results.copy()
+
+    # Step 1: shift all three columns by calibration offset
     for stat, offset in _CALIBRATION.items():
         for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
             if col in results.columns:
                 results[col] = (results[col] - offset).clip(lower=0.0).round(1)
+
+    # Step 2: clip predictions to [p10, p90] where bounds exist
+    n_above = n_below = 0
+    for stat in _CALIBRATION:
+        pred_col = f"{stat}_PRED"
+        lo_col   = f"{stat}_LOW"
+        hi_col   = f"{stat}_HIGH"
+        if pred_col not in results.columns:
+            continue
+        has_bounds = results[lo_col].notna() & results[hi_col].notna()
+        if not has_bounds.any():
+            continue
+
+        above = has_bounds & (results[pred_col] > results[hi_col])
+        below = has_bounds & (results[pred_col] < results[lo_col])
+        n_above += int(above.sum())
+        n_below += int(below.sum())
+
+        results.loc[above, pred_col] = results.loc[above, hi_col]
+        results.loc[below, pred_col] = results.loc[below, lo_col]
+
+    logger.info(f"Clipped {n_above} predictions above p90, {n_below} below p10.")
     return results
 
 
