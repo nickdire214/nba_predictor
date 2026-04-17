@@ -53,33 +53,35 @@ def load_predictions(date_str: str) -> pd.DataFrame:
 
 def fetch_actuals(date_str: str) -> pd.DataFrame:
     """
-    Pull player game logs for a specific date using playergamelogs
-    date_from / date_to set to the same date to get that day's box scores.
+    Pull player game logs for a specific date using playergamelogs.
+    Tries Regular Season first; falls back to Playoffs if empty.
     """
     logger.info(f"Fetching actual box scores for {date_str} ...")
     dt = datetime.strptime(date_str, "%Y-%m-%d")
-    # NBA API date format: MM/DD/YYYY
     date_fmt = dt.strftime("%m/%d/%Y")
 
-    try:
-        logs = playergamelogs.PlayerGameLogs(
-            season_nullable="2025-26",
-            season_type_nullable="Regular Season",
-            date_from_nullable=date_fmt,
-            date_to_nullable=date_fmt,
-        )
-        df = logs.get_data_frames()[0]
-    except Exception as e:
-        logger.error(f"Failed to fetch actuals: {e}")
-        raise
+    for season_type in ("Regular Season", "PlayIn", "Playoffs"):
+        try:
+            logs = playergamelogs.PlayerGameLogs(
+                season_nullable="2025-26",
+                season_type_nullable=season_type,
+                date_from_nullable=date_fmt,
+                date_to_nullable=date_fmt,
+            )
+            df = logs.get_data_frames()[0]
+        except Exception as e:
+            logger.error(f"Failed to fetch actuals ({season_type}): {e}")
+            raise
 
-    if df.empty:
-        logger.warning(f"No box score data returned for {date_str}.")
-        return df
+        if not df.empty:
+            df["PLAYER_NAME_ASCII"] = df["PLAYER_NAME"].apply(_ascii)
+            logger.info(f"Fetched {len(df)} rows for {date_str} ({season_type})")
+            return df
 
-    df["PLAYER_NAME_ASCII"] = df["PLAYER_NAME"].apply(_ascii)
-    logger.info(f"Fetched {len(df)} player rows for {date_str}")
-    return df
+        logger.info(f"No data for {date_str} ({season_type}), trying next...")
+
+    logger.warning(f"No box score data returned for {date_str} (Regular Season or Playoffs).")
+    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
