@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from src.ingestion.roster import get_available_players
 from src.ingestion.injuries import get_unavailable_players
 from src.ingestion.odds import get_vegas_lines
+from src.ingestion.playoff_stats import get_playoff_elevation
 from src.features.engineer import (
     prepare_player_df,
     add_rolling_averages,
@@ -454,6 +455,101 @@ def merge_vegas_lines(results: pd.DataFrame) -> pd.DataFrame:
     return results
 
 
+def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    Boost predictions for players with a positive playoff elevation signal.
+    Applies 30% of each player's historical playoff-vs-regular-season delta.
+    Also adjusts p10/p90 bounds by the same amount.
+    Only called when is_playoff_date() is True.
+    """
+    elev = get_playoff_elevation()
+    if elev.empty:
+        logger.warning("Playoff elevation table is empty -- skipping elevation adjustment.")
+        return results
+
+    results = results.copy()
+
+    import unicodedata as _ud
+    def _ascii(n):
+        return _ud.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+
+    results["_name_ascii"] = results["PLAYER_NAME"].apply(_ascii)
+
+    n_with_history = 0
+    pts_elevations = []
+
+    for idx, row in results.iterrows():
+        key = row["_name_ascii"]
+        if key not in elev.index:
+            continue
+
+        player_elev = elev.loc[key]
+        if player_elev["PLAYOFF_GAMES"] == 0:
+            continue
+
+        n_with_history += 1
+        for stat, elev_col in [("PTS", "PTS_ELEVATION"), ("REB", "REB_ELEVATION"), ("AST", "AST_ELEVATION")]:
+            delta = float(player_elev[elev_col]) * 0.3
+            if stat == "PTS":
+                pts_elevations.append(delta)
+            for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
+                if col in results.columns and pd.notna(results.at[idx, col]):
+                    results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + delta), 1)
+
+    results = results.drop(columns=["_name_ascii"])
+
+    avg_pts_elev = sum(pts_elevations) / len(pts_elevations) if pts_elevations else 0.0
+    logger.info(
+        f"Playoff elevation applied: {n_with_history} players with history, "
+        f"avg PTS elevation {avg_pts_elev:+.1f}"
+    )
+    return results
+
+
+def is_playoff_date(game_date: str = None) -> bool:
+    """
+    Return True if the games on game_date are playoff games.
+    Playoff game IDs start with '004'; regular season IDs start with '002'.
+    """
+    if game_date is None:
+        game_date = datetime.now().strftime("%Y-%m-%d")
+    try:
+        games_df = get_todays_games(game_date)
+        if games_df.empty or "gameId" not in games_df.columns:
+            return False
+        return bool(games_df["gameId"].astype(str).str.startswith("004").any())
+    except Exception as e:
+        logger.warning(f"Could not determine playoff status: {e}")
+        return False
+
+
+def apply_playoff_rotation_filter(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    Playoff-only filter: remove players where Vegas has set a line below 8.0 PTS
+    (deep bench / DNP risk). Players with no Vegas line are kept but flagged
+    ROTATION_UNCERTAIN=1 so the dashboard can highlight them.
+    """
+    results = results.copy()
+    results["ROTATION_UNCERTAIN"] = 0
+
+    has_vegas = results["VEGAS_PTS"].notna()
+    low_vegas = has_vegas & (results["VEGAS_PTS"] < 8.0)
+    no_vegas  = ~has_vegas
+
+    n_removed = int(low_vegas.sum())
+    results.loc[no_vegas, "ROTATION_UNCERTAIN"] = 1
+    n_uncertain = int(no_vegas.sum())
+
+    logger.info(
+        f"Playoff rotation filter removed {n_removed} players with Vegas lines under 8.0"
+    )
+    logger.info(
+        f"Playoff rotation filter flagged {n_uncertain} players as ROTATION_UNCERTAIN (no Vegas line)"
+    )
+
+    return results[~low_vegas].copy()
+
+
 def save_predictions(results: pd.DataFrame, game_date: str):
     """Save prediction output to data/predictions/"""
     out_dir = os.path.join("data", "predictions")
@@ -664,5 +760,11 @@ if __name__ == "__main__":
             results = apply_calibration(results)
             results = merge_vegas_lines(results)
             date_str = game_date or datetime.now().strftime("%Y-%m-%d")
+            if is_playoff_date(date_str):
+                logger.info("Playoff games detected -- applying elevation and rotation filter.")
+                results = apply_playoff_elevation(results)
+                results = apply_playoff_rotation_filter(results)
+            else:
+                logger.info("Regular season games -- skipping playoff adjustments.")
             save_predictions(results, date_str)
             display_predictions(results, min_pts=8.0, game_date=date_str)

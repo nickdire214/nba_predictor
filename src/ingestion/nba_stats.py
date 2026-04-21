@@ -105,6 +105,16 @@ def fetch_team_gamelogs_multiyear(seasons: list, season_type: str = "Regular Sea
     return combined
 
 
+def fetch_playoff_gamelogs(seasons: list = None) -> pd.DataFrame:
+    """
+    Fetch player game logs for Playoffs across multiple seasons.
+    Defaults to the last three completed seasons.
+    """
+    if seasons is None:
+        seasons = ["2022-23", "2023-24", "2024-25"]
+    return fetch_player_gamelogs_multiyear(seasons, season_type="Playoffs")
+
+
 def save_raw(df: pd.DataFrame, filename_prefix: str, season: str = "2025-26") -> str:
     """
     Save a DataFrame to data/raw/ as a timestamped CSV.
