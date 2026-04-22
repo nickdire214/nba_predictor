@@ -375,29 +375,50 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
 # Calibration
 # ─────────────────────────────────────────────
 
-# Calibration offsets derived from five evaluation days.
-# Avg bias with -0.80 calibration was -0.28, so true over-prediction ~+0.52 -> use 0.50.
+# Regular season calibration offsets (derived from five evaluation days).
 _CALIBRATION = {
     "PTS": 0.50,
     "REB": 0.10,
     "AST": 0.05,
 }
 
+# Additional offset applied on top of regular season calibration for playoff games.
+# Playoffs show +1.5 to +2.5 additional over-prediction beyond regular season bias.
+_PLAYOFF_EXTRA = {
+    "PTS": 1.50,
+    "REB": 0.00,
+    "AST": 0.20,
+}
 
-def apply_calibration(results: pd.DataFrame) -> pd.DataFrame:
+
+def apply_calibration(results: pd.DataFrame, is_playoff: bool = False) -> pd.DataFrame:
     """
     Subtract known positive bias from predictions and quantile bounds,
     then clip each prediction to stay within its own p10-p90 interval.
+    When is_playoff=True applies an additional playoff-specific offset.
     """
-    logger.info(
-        f"Applying calibration: PTS -{_CALIBRATION['PTS']:.2f}, "
-        f"REB -{_CALIBRATION['REB']:.2f}, "
-        f"AST -{_CALIBRATION['AST']:.2f}"
-    )
+    offsets = {
+        stat: _CALIBRATION[stat] + (_PLAYOFF_EXTRA[stat] if is_playoff else 0.0)
+        for stat in _CALIBRATION
+    }
+
+    if is_playoff:
+        logger.info(
+            f"Playoff calibration: PTS -{offsets['PTS']:.2f} "
+            f"REB -{offsets['REB']:.2f} "
+            f"AST -{offsets['AST']:.2f}"
+        )
+    else:
+        logger.info(
+            f"Regular season calibration: PTS -{offsets['PTS']:.2f} "
+            f"REB -{offsets['REB']:.2f} "
+            f"AST -{offsets['AST']:.2f}"
+        )
+
     results = results.copy()
 
     # Step 1: shift all three columns by calibration offset
-    for stat, offset in _CALIBRATION.items():
+    for stat, offset in offsets.items():
         for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
             if col in results.columns:
                 results[col] = (results[col] - offset).clip(lower=0.0).round(1)
@@ -757,10 +778,11 @@ if __name__ == "__main__":
             logger.warning("No available players after filtering.")
         else:
             results = generate_predictions(models, player_df, q_models=q_models)
-            results = apply_calibration(results)
-            results = merge_vegas_lines(results)
             date_str = game_date or datetime.now().strftime("%Y-%m-%d")
-            if is_playoff_date(date_str):
+            playoff = is_playoff_date(date_str)
+            results = apply_calibration(results, is_playoff=playoff)
+            results = merge_vegas_lines(results)
+            if playoff:
                 logger.info("Playoff games detected -- applying elevation and rotation filter.")
                 results = apply_playoff_elevation(results)
                 results = apply_playoff_rotation_filter(results)
