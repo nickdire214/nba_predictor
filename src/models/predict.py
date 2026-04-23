@@ -24,6 +24,7 @@ from src.features.engineer import (
     add_defensive_strength,
     add_absence_features,
     add_foul_features,
+    add_player_embeddings,
     load_latest_raw,
 )
 
@@ -34,10 +35,14 @@ from src.features.engineer import (
 
 def load_models() -> dict:
     """
-    Load production models. Tries Ridge (.pkl) first; falls back to XGBoost (.json).
-    All three stats must use the same backend -- Ridge is only active when all three
-    pkl files exist.
+    Load production models. Priority: Bayesian Ridge > Ridge > XGBoost.
+    All three stats must use the same backend.
     """
+    bayesian_files = {
+        "PTS": os.path.join("models", "pts_model_bayesian.pkl"),
+        "REB": os.path.join("models", "reb_model_bayesian.pkl"),
+        "AST": os.path.join("models", "ast_model_bayesian.pkl"),
+    }
     ridge_files = {
         "PTS": os.path.join("models", "pts_model_ridge.pkl"),
         "REB": os.path.join("models", "reb_model_ridge.pkl"),
@@ -49,9 +54,16 @@ def load_models() -> dict:
         "AST": os.path.join("models", "ast_model.json"),
     }
 
-    use_ridge = all(os.path.exists(p) for p in ridge_files.values())
+    use_bayesian = all(os.path.exists(p) for p in bayesian_files.values())
+    use_ridge    = all(os.path.exists(p) for p in ridge_files.values())
 
-    if use_ridge:
+    if use_bayesian:
+        logger.info("Using Bayesian Ridge production models.")
+        models = {}
+        for stat, path in bayesian_files.items():
+            models[stat] = joblib.load(path)
+            logger.info(f"Loaded {stat} Bayesian Ridge model from {path}")
+    elif use_ridge:
         logger.info("Using Ridge production models.")
         models = {}
         for stat, path in ridge_files.items():
@@ -109,7 +121,7 @@ BASE_FEATURES = [
     "MIN_avg_L5", "MIN_avg_L10",
     "TEAM_PACE_L10", "OPP_PACE_L10", "COMBINED_PACE",
     "GAMES_SINCE_RETURN", "IS_RETURNING", "RETURN_GAME_NUMBER",
-]
+] + [f"EMB_{i}" for i in range(16)]
 
 STAT_FEATURES = {
     "PTS": BASE_FEATURES + [
@@ -210,9 +222,9 @@ def build_prediction_input(game_date: str = None):
     if not os.path.exists(features_path):
         raise FileNotFoundError("Feature matrix not found. Run engineer.py first.")
 
-    df = pd.read_csv(features_path)
-    df = df.copy()
+    df = pd.read_csv(features_path).copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = add_player_embeddings(df)
 
     games_df = get_todays_games(game_date)
     if games_df.empty:

@@ -274,3 +274,5 @@ Players with an absolute PTS error greater than 15 are excluded from the clean m
 - Real-time lineup data integration (starting lineup confirmation before tip-off)
 - Series-specific opponent adjustment (model learns how teams match up over a playoff series)
 - Separate playoff model trained exclusively on playoff data
+- Player embeddings: learn a dense vector representation for each player that captures latent characteristics (consistency, playing style, clutch tendency) beyond what rolling averages can express. Would improve variance estimation and help with small sample players. Likely implemented as a hybrid -- train an autoencoder on historical game logs to produce a 16-dimensional player vector, then feed those as additional features into the existing Ridge model.
+- Bayesian Ridge Regression: a natural upgrade from plain Ridge that produces a full probability distribution over predictions rather than a point estimate. Confidence intervals would come directly from the model rather than needing separate XGBoost quantile models, simplifying the architecture while potentially improving calibration.

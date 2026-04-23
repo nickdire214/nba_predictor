@@ -7,7 +7,7 @@ import pandas as pd
 import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostRegressor
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, BayesianRidge
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -61,6 +61,14 @@ def build_models() -> dict:
             ("scaler", StandardScaler()),
             ("ridge",  Ridge(alpha=1.0)),
         ]),
+        "BayesianRidge": Pipeline([
+            ("scaler", StandardScaler()),
+            ("ridge",  BayesianRidge(
+                max_iter=300,
+                tol=1e-3,
+                compute_score=True,
+            )),
+        ]),
     }
 
 
@@ -88,7 +96,7 @@ if __name__ == "__main__":
     # results[model_name][stat] = {"MAE": ..., "R2": ...}
     results: dict[str, dict] = {}
 
-    for model_name in ["XGBoost", "LightGBM", "CatBoost", "Ridge"]:
+    for model_name in ["XGBoost", "LightGBM", "CatBoost", "Ridge", "BayesianRidge"]:
         print(f"\n{'='*50}")
         print(f"  {model_name}")
         print(f"{'='*50}")
@@ -115,7 +123,7 @@ if __name__ == "__main__":
     )
     print(f"{'-'*75}")
 
-    for name in ["XGBoost", "LightGBM", "CatBoost", "Ridge"]:
+    for name in ["XGBoost", "LightGBM", "CatBoost", "Ridge", "BayesianRidge"]:
         r = results[name]
         print(
             f"{name:<12}  {r['PTS']['MAE']:>7.3f}  {r['PTS']['R2']:>6.3f}  "
@@ -126,16 +134,36 @@ if __name__ == "__main__":
     print(f"{'='*75}")
 
     # ── Determine winner on PTS MAE ───────────────────────────────────────
-    xgb_pts_mae = results["XGBoost"]["PTS"]["MAE"]
-    best_name   = min(results, key=lambda n: results[n]["PTS"]["MAE"])
-    best_mae    = results[best_name]["PTS"]["MAE"]
+    ridge_pts_mae = results["Ridge"]["PTS"]["MAE"]
+    best_name     = min(results, key=lambda n: results[n]["PTS"]["MAE"])
+    best_mae      = results[best_name]["PTS"]["MAE"]
 
-    print(f"\n  XGBoost PTS MAE : {xgb_pts_mae:.3f}")
+    print(f"\n  Ridge PTS MAE   : {ridge_pts_mae:.3f}")
     print(f"  Best model      : {best_name} (PTS MAE {best_mae:.3f})")
 
-    if best_name != "XGBoost" and best_mae < xgb_pts_mae:
-        print(f"\n  {best_name} beats XGBoost by "
-              f"{xgb_pts_mae - best_mae:.3f} MAE -- saving as production models.")
+    import joblib
+
+    if best_name == "BayesianRidge" and best_mae < ridge_pts_mae:
+        print(f"\n  BayesianRidge beats Ridge by "
+              f"{ridge_pts_mae - best_mae:.3f} MAE -- saving as production models.")
+
+        for stat, config in STAT_CONFIGS.items():
+            X_train, y_train = prepare_xy(train_df, config["features"], config["target"])
+            X_test,  y_test  = prepare_xy(test_df,  config["features"], config["target"])
+            winner = build_models()["BayesianRidge"]
+            metrics = run_one(winner, X_train, y_train, X_test, y_test)
+
+            stat_lower = stat.lower()
+            joblib_path = os.path.join("models", f"{stat_lower}_model_bayesian.pkl")
+            joblib.dump(winner, joblib_path)
+            logger.info(f"  Saved {stat} BayesianRidge -> {joblib_path}")
+            print(f"  Saved {stat} BayesianRidge model -> {joblib_path}")
+
+        print(f"\n  Update load_models() in predict.py to try bayesian pkl files first.")
+
+    elif best_name not in ("Ridge", "BayesianRidge") and best_mae < ridge_pts_mae:
+        print(f"\n  {best_name} beats Ridge by "
+              f"{ridge_pts_mae - best_mae:.3f} MAE -- saving as production models.")
 
         for stat, config in STAT_CONFIGS.items():
             X_train, y_train = prepare_xy(train_df, config["features"], config["target"])
@@ -143,17 +171,11 @@ if __name__ == "__main__":
             winner = build_models()[best_name]
             metrics = run_one(winner, X_train, y_train, X_test, y_test)
 
-            # For sklearn-compatible models wrap predict inside a thin XGBRegressor shell
-            # so predict.py can load them with model.load_model(). Instead, save via
-            # xgb native format only for XGBoost; for others use joblib alongside a note.
-            import joblib
             stat_lower = stat.lower()
             joblib_path = os.path.join("models", f"{stat_lower}_model_{best_name.lower()}.pkl")
             joblib.dump(winner, joblib_path)
             logger.info(f"  Saved {stat} {best_name} -> {joblib_path}")
             print(f"  Saved {stat} {best_name} model -> {joblib_path}")
 
-        print(f"\n  NOTE: production predict.py still uses XGBoost .json models.")
-        print(f"  To switch, retrain with {best_name} in train.py and update load_models().")
     else:
-        print(f"\n  XGBoost remains the best model -- no production model change.")
+        print(f"\n  Ridge remains the best model -- no production model change.")

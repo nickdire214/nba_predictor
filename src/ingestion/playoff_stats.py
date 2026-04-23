@@ -71,7 +71,7 @@ def get_playoff_elevation(
         playoff_agg["AST_ELEVATION"] = 0.0
         return playoff_agg
 
-    feat_df = pd.read_csv(features_path)
+    feat_df = pd.read_csv(features_path).copy()
     feat_df["PLAYER_NAME_ASCII"] = feat_df["PLAYER_NAME"].apply(_ascii)
 
     # Use the last row per player (most recent game) and read their L20 rolling averages

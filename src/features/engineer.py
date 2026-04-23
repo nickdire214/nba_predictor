@@ -2,7 +2,12 @@ import pandas as pd
 import numpy as np
 import os
 import glob
+import unicodedata
 from loguru import logger
+
+
+def _ascii(name: str) -> str:
+    return unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii").strip()
 
 
 def load_latest_raw(prefix: str, filename: str = None) -> pd.DataFrame:
@@ -690,6 +695,42 @@ def add_foul_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
     
 # ─────────────────────────────────────────────
+# Player embeddings
+# ─────────────────────────────────────────────
+
+def add_player_embeddings(df: pd.DataFrame,
+                          embeddings_path: str = None) -> pd.DataFrame:
+    """
+    Join pre-computed player embeddings (EMB_0..EMB_15) onto df.
+    Players with no embedding get zeros.
+    Embedding file is produced by src/models/embeddings.py.
+    """
+    if embeddings_path is None:
+        embeddings_path = os.path.join("data", "features", "player_embeddings.csv")
+
+    if not os.path.exists(embeddings_path):
+        logger.warning(f"Embeddings file not found: {embeddings_path} -- skipping.")
+        return df
+
+    emb = pd.read_csv(embeddings_path)
+    emb_cols = [c for c in emb.columns if c.startswith("EMB_")]
+
+    emb["PLAYER_NAME_ASCII"] = emb["PLAYER_NAME"].apply(_ascii)
+    emb = emb[["PLAYER_NAME_ASCII"] + emb_cols].drop_duplicates("PLAYER_NAME_ASCII")
+
+    df = df.copy()
+    df["PLAYER_NAME_ASCII"] = df["PLAYER_NAME"].apply(_ascii)
+
+    df = df.merge(emb, on="PLAYER_NAME_ASCII", how="left")
+    df[emb_cols] = df[emb_cols].fillna(0.0)
+    df = df.drop(columns=["PLAYER_NAME_ASCII"])
+
+    n_matched = df[emb_cols[0]].ne(0).sum()
+    logger.info(f"Player embeddings joined: {n_matched}/{len(df)} players matched.")
+    return df
+
+
+# ─────────────────────────────────────────────
 # Run all features and save
 # ─────────────────────────────────────────────
 
@@ -717,6 +758,9 @@ def build_player_features(use_historical: bool = False, return_window: int = 1) 
     df = add_return_from_injury_features(df, return_window=return_window)
     df = add_absence_features(df)
     df = add_foul_features(df)
+
+    if use_historical:
+        df = add_player_embeddings(df)
 
     out_dir = os.path.join("data", "features")
     os.makedirs(out_dir, exist_ok=True)

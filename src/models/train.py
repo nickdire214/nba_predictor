@@ -11,6 +11,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.features.engineer import add_player_embeddings
+
 
 # ─────────────────────────────────────────────
 # Feature sets per target stat
@@ -35,7 +39,7 @@ BASE_FEATURES = [
     "GAMES_SINCE_RETURN",
     "IS_RETURNING",
     "RETURN_GAME_NUMBER",
-]
+] + [f"EMB_{i}" for i in range(16)]
 
 STAT_CONFIGS = {
     "PTS": {
@@ -265,6 +269,7 @@ def show_feature_importance(model, feature_names: list, target: str):
 
 if __name__ == "__main__":
     df = load_features()
+    df = add_player_embeddings(df)
     train_df, test_df = split_data(df)
 
     all_metrics = {}
