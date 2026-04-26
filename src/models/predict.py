@@ -488,11 +488,23 @@ def merge_vegas_lines(results: pd.DataFrame) -> pd.DataFrame:
     return results
 
 
+def _playoff_elevation_weight(games: int) -> float:
+    if games >= 30:
+        return 0.50
+    if games >= 15:
+        return 0.40
+    if games >= 5:
+        return 0.30
+    if games > 0:
+        return 0.15
+    return 0.00
+
+
 def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
     """
     Boost predictions for players with a positive playoff elevation signal.
-    Applies 30% of each player's historical playoff-vs-regular-season delta.
-    Also adjusts p10/p90 bounds by the same amount.
+    Applies a tiered weight based on career playoff games played.
+    Also adjusts LOW/HIGH bounds by the same amount.
     Only called when is_playoff_date() is True.
     """
     elev = get_playoff_elevation()
@@ -508,8 +520,7 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
 
     results["_name_ascii"] = results["PLAYER_NAME"].apply(_ascii)
 
-    n_with_history = 0
-    pts_elevations = []
+    tier_pts = {">= 30": [], "15-29": [], "5-14": [], "< 5": []}
 
     for idx, row in results.iterrows():
         key = row["_name_ascii"]
@@ -517,25 +528,44 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
             continue
 
         player_elev = elev.loc[key]
-        if player_elev["PLAYOFF_GAMES"] == 0:
+        games = int(player_elev["PLAYOFF_GAMES"])
+        weight = _playoff_elevation_weight(games)
+        if weight == 0.0:
             continue
 
-        n_with_history += 1
+        if games >= 30:
+            bucket = ">= 30"
+        elif games >= 15:
+            bucket = "15-29"
+        elif games >= 5:
+            bucket = "5-14"
+        else:
+            bucket = "< 5"
+
         for stat, elev_col in [("PTS", "PTS_ELEVATION"), ("REB", "REB_ELEVATION"), ("AST", "AST_ELEVATION")]:
-            delta = float(player_elev[elev_col]) * 0.3
+            delta = float(player_elev[elev_col]) * weight
             if stat == "PTS":
-                pts_elevations.append(delta)
+                tier_pts[bucket].append(delta)
             for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
                 if col in results.columns and pd.notna(results.at[idx, col]):
                     results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + delta), 1)
 
     results = results.drop(columns=["_name_ascii"])
 
-    avg_pts_elev = sum(pts_elevations) / len(pts_elevations) if pts_elevations else 0.0
-    logger.info(
-        f"Playoff elevation applied: {n_with_history} players with history, "
-        f"avg PTS elevation {avg_pts_elev:+.1f}"
-    )
+    total = sum(len(v) for v in tier_pts.values())
+    logger.info(f"Playoff elevation applied: {total} players")
+
+    labels = [
+        (">= 30", "30+ games"),
+        ("15-29", "15-29 games"),
+        ("5-14",  "5-14 games"),
+    ]
+    for key, label in labels:
+        vals = tier_pts[key]
+        if vals:
+            avg = sum(vals) / len(vals)
+            logger.info(f"  {label}: {len(vals)} players avg {avg:+.1f} pts")
+
     return results
 
 
