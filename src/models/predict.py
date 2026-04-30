@@ -569,6 +569,89 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
     return results
 
 
+def _series_weight(games: int) -> float:
+    if games >= 5:
+        return 0.25
+    if games == 4:
+        return 0.20
+    if games == 3:
+        return 0.15
+    if games == 2:
+        return 0.10
+    return 0.00
+
+
+def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFrame:
+    """
+    For each player with 2+ games in the current series, apply a tiered weight
+    (based on series games played) to their in-series PTS/REB/AST delta.
+    Only called when is_playoff_date() is True.
+    """
+    from src.ingestion.series_stats import get_series_adjustments
+
+    series = get_series_adjustments(game_date)
+    if series.empty:
+        logger.warning("Series adjustments empty -- skipping series adjustment.")
+        return results
+
+    results = results.copy()
+
+    import unicodedata as _ud
+    def _ascii(n):
+        return _ud.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+
+    results["_name_ascii"] = results["PLAYER_NAME"].apply(_ascii)
+    series_idx = series.set_index("PLAYER_NAME_ASCII")
+
+    tier_pts = {"5+": [], "4": [], "3": [], "2": []}
+
+    for idx, row in results.iterrows():
+        key = row["_name_ascii"]
+        if key not in series_idx.index:
+            continue
+
+        player_series = series_idx.loc[key]
+        games = int(player_series["SERIES_GAMES"])
+        weight = _series_weight(games)
+        if weight == 0.0:
+            continue
+
+        if games >= 5:
+            bucket = "5+"
+        elif games == 4:
+            bucket = "4"
+        elif games == 3:
+            bucket = "3"
+        else:
+            bucket = "2"
+
+        for stat, delta_col in [
+            ("PTS", "SERIES_PTS_DELTA"),
+            ("REB", "SERIES_REB_DELTA"),
+            ("AST", "SERIES_AST_DELTA"),
+        ]:
+            delta = float(player_series[delta_col]) * weight
+            if stat == "PTS":
+                tier_pts[bucket].append(delta)
+            for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
+                if col in results.columns and pd.notna(results.at[idx, col]):
+                    results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + delta), 1)
+
+    results = results.drop(columns=["_name_ascii"])
+
+    total = sum(len(v) for v in tier_pts.values())
+    logger.info(f"Series adjustment applied: {total} players")
+
+    labels = [("5+", "5+ games"), ("4", "4 games"), ("3", "3 games"), ("2", "2 games")]
+    for key, label in labels:
+        vals = tier_pts[key]
+        if vals:
+            avg = sum(vals) / len(vals)
+            logger.info(f"  {label}: {len(vals)} players avg {avg:+.1f} pts")
+
+    return results
+
+
 def is_playoff_date(game_date: str = None) -> bool:
     """
     Return True if the games on game_date are playoff games.
@@ -825,8 +908,9 @@ if __name__ == "__main__":
             results = apply_calibration(results, is_playoff=playoff)
             results = merge_vegas_lines(results)
             if playoff:
-                logger.info("Playoff games detected -- applying elevation and rotation filter.")
+                logger.info("Playoff games detected -- applying elevation, series adjustment, and rotation filter.")
                 results = apply_playoff_elevation(results)
+                results = apply_series_adjustment(results, date_str)
                 results = apply_playoff_rotation_filter(results)
             else:
                 logger.info("Regular season games -- skipping playoff adjustments.")
