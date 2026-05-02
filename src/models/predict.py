@@ -33,11 +33,17 @@ from src.features.engineer import (
 # Load trained models
 # ─────────────────────────────────────────────
 
-def load_models() -> dict:
+def load_models(is_playoff: bool = False) -> dict:
     """
-    Load production models. Priority: Bayesian Ridge > Ridge > XGBoost.
-    All three stats must use the same backend.
+    Load production models.
+    When is_playoff=True, tries playoff Ridge models first before falling back.
+    Priority overall: Playoff Ridge > Bayesian Ridge > Ridge > XGBoost.
     """
+    playoff_files = {
+        "PTS": os.path.join("models", "pts_model_playoff_ridge.pkl"),
+        "REB": os.path.join("models", "reb_model_playoff_ridge.pkl"),
+        "AST": os.path.join("models", "ast_model_playoff_ridge.pkl"),
+    }
     bayesian_files = {
         "PTS": os.path.join("models", "pts_model_bayesian.pkl"),
         "REB": os.path.join("models", "reb_model_bayesian.pkl"),
@@ -54,17 +60,24 @@ def load_models() -> dict:
         "AST": os.path.join("models", "ast_model.json"),
     }
 
+    use_playoff  = is_playoff and all(os.path.exists(p) for p in playoff_files.values())
     use_bayesian = all(os.path.exists(p) for p in bayesian_files.values())
     use_ridge    = all(os.path.exists(p) for p in ridge_files.values())
 
-    if use_bayesian:
-        logger.info("Using Bayesian Ridge production models.")
+    if use_playoff:
+        logger.info("Using Playoff Ridge models.")
+        models = {}
+        for stat, path in playoff_files.items():
+            models[stat] = joblib.load(path)
+            logger.info(f"Loaded {stat} Playoff Ridge model from {path}")
+    elif use_bayesian:
+        logger.info("Using Regular Season Bayesian Ridge models.")
         models = {}
         for stat, path in bayesian_files.items():
             models[stat] = joblib.load(path)
             logger.info(f"Loaded {stat} Bayesian Ridge model from {path}")
     elif use_ridge:
-        logger.info("Using Ridge production models.")
+        logger.info("Using Regular Season Ridge models.")
         models = {}
         for stat, path in ridge_files.items():
             models[stat] = joblib.load(path)
@@ -80,7 +93,7 @@ def load_models() -> dict:
             models[stat] = model
             logger.info(f"Loaded {stat} XGBoost model from {path}")
 
-    return models
+    return models, use_playoff
 
 
 def load_quantile_models() -> dict:
@@ -387,36 +400,53 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
 # Calibration
 # ─────────────────────────────────────────────
 
-# Regular season calibration offsets (derived from five evaluation days).
+# Regular season calibration offsets (derived from evaluation days).
 _CALIBRATION = {
     "PTS": 0.50,
     "REB": 0.10,
     "AST": 0.05,
 }
 
-# Additional offset applied on top of regular season calibration for playoff games.
-# Playoffs show +1.5 to +2.5 additional over-prediction beyond regular season bias.
-_PLAYOFF_EXTRA = {
+# Additional offset for playoff games using the regular season model.
+# The regular season model over-predicts more in playoffs.
+_PLAYOFF_EXTRA_RS = {
     "PTS": 1.50,
     "REB": 0.00,
     "AST": 0.20,
 }
 
+# Reduced additional offset for playoff games using the playoff model.
+# The playoff model already accounts for playoff scoring patterns.
+_PLAYOFF_EXTRA_PO = {
+    "PTS": 0.50,
+    "REB": 0.00,
+    "AST": 0.10,
+}
 
-def apply_calibration(results: pd.DataFrame, is_playoff: bool = False) -> pd.DataFrame:
+
+def apply_calibration(
+    results: pd.DataFrame,
+    is_playoff: bool = False,
+    use_playoff_model: bool = False,
+) -> pd.DataFrame:
     """
     Subtract known positive bias from predictions and quantile bounds,
     then clip each prediction to stay within its own p10-p90 interval.
-    When is_playoff=True applies an additional playoff-specific offset.
+    When is_playoff=True, applies an additional playoff offset.
+    When use_playoff_model=True the reduced offset is used since the
+    playoff model already captures playoff scoring patterns.
     """
-    offsets = {
-        stat: _CALIBRATION[stat] + (_PLAYOFF_EXTRA[stat] if is_playoff else 0.0)
-        for stat in _CALIBRATION
-    }
+    if is_playoff:
+        extra = _PLAYOFF_EXTRA_PO if use_playoff_model else _PLAYOFF_EXTRA_RS
+    else:
+        extra = {"PTS": 0.0, "REB": 0.0, "AST": 0.0}
+
+    offsets = {stat: _CALIBRATION[stat] + extra[stat] for stat in _CALIBRATION}
 
     if is_playoff:
+        label = "playoff model" if use_playoff_model else "regular model"
         logger.info(
-            f"Playoff calibration: PTS -{offsets['PTS']:.2f} "
+            f"Playoff calibration ({label}): PTS -{offsets['PTS']:.2f} "
             f"REB -{offsets['REB']:.2f} "
             f"AST -{offsets['AST']:.2f}"
         )
@@ -696,12 +726,12 @@ def apply_playoff_rotation_filter(results: pd.DataFrame) -> pd.DataFrame:
     return results[~low_vegas].copy()
 
 
-def save_predictions(results: pd.DataFrame, game_date: str):
+def save_predictions(results: pd.DataFrame, game_date: str, suffix: str = ""):
     """Save prediction output to data/predictions/"""
     out_dir = os.path.join("data", "predictions")
     os.makedirs(out_dir, exist_ok=True)
 
-    filename = f"predictions_{game_date}.csv"
+    filename = f"predictions_{game_date}{suffix}.csv"
     filepath = os.path.join(out_dir, filename)
     results.to_csv(filepath, index=False)
     logger.info(f"Saved predictions to {filepath}")
@@ -883,10 +913,14 @@ def display_predictions(results: pd.DataFrame, min_pts: float = 8.0, game_date: 
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    game_date = sys.argv[1] if len(sys.argv) > 1 else None
-    season = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
+    game_date        = sys.argv[1] if len(sys.argv) > 1 else None
+    season           = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
+    no_playoff_model = "--no-playoff-model" in sys.argv
 
-    models   = load_models()
+    date_str = game_date or datetime.now().strftime("%Y-%m-%d")
+    playoff  = is_playoff_date(date_str)
+
+    models, used_playoff_model = load_models(is_playoff=(playoff and not no_playoff_model))
     q_models = load_quantile_models()
     player_df, playing_team_ids = build_prediction_input(game_date=game_date)
 
@@ -903,9 +937,11 @@ if __name__ == "__main__":
             logger.warning("No available players after filtering.")
         else:
             results = generate_predictions(models, player_df, q_models=q_models)
-            date_str = game_date or datetime.now().strftime("%Y-%m-%d")
-            playoff = is_playoff_date(date_str)
-            results = apply_calibration(results, is_playoff=playoff)
+            results = apply_calibration(
+                results,
+                is_playoff=playoff,
+                use_playoff_model=used_playoff_model,
+            )
             results = merge_vegas_lines(results)
             if playoff:
                 logger.info("Playoff games detected -- applying elevation, series adjustment, and rotation filter.")
@@ -914,5 +950,6 @@ if __name__ == "__main__":
                 results = apply_playoff_rotation_filter(results)
             else:
                 logger.info("Regular season games -- skipping playoff adjustments.")
-            save_predictions(results, date_str)
+            suffix = "_regular_model" if no_playoff_model else ""
+            save_predictions(results, date_str, suffix=suffix)
             display_predictions(results, min_pts=8.0, game_date=date_str)

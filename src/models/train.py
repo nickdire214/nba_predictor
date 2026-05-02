@@ -13,7 +13,20 @@ import xgboost as xgb
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from src.features.engineer import add_player_embeddings
+from src.features.engineer import (
+    add_player_embeddings,
+    prepare_player_df,
+    add_rolling_averages,
+    add_rest_days,
+    add_home_away,
+    add_defensive_strength,
+    add_positional_matchup_features,
+    add_pace_features,
+    add_return_from_injury_features,
+    add_absence_features,
+    add_foul_features,
+)
+from src.ingestion.nba_stats import fetch_player_gamelogs_multiyear
 
 
 # ─────────────────────────────────────────────
@@ -261,6 +274,143 @@ def show_feature_importance(model, feature_names: list, target: str):
 
     print(f"\n--- Top 10 features for {target} ---")
     print(importance.head(10).to_string())
+
+
+# ─────────────────────────────────────────────
+# Playoff model training
+# ─────────────────────────────────────────────
+
+def _build_playoff_features(raw_path: str) -> pd.DataFrame:
+    """Run the full feature engineering pipeline on playoff game logs."""
+    df = pd.read_csv(raw_path)
+    df = prepare_player_df(df)
+    df = add_rolling_averages(df)
+    df = add_rest_days(df)
+    df = add_home_away(df)
+    df = add_defensive_strength(df, team_df=None)
+    df = add_positional_matchup_features(df)
+    df = add_pace_features(df, team_df=None)
+    df = add_return_from_injury_features(df, return_window=1)
+    df = add_absence_features(df)
+    df = add_foul_features(df)
+    df = add_player_embeddings(df)
+    logger.info(f"Playoff feature matrix built: {df.shape}")
+    return df
+
+
+def train_playoff_models():
+    """
+    Train Ridge models exclusively on historical playoff game data.
+    Uses all available playoff data (no train/test split).
+    Saves to models/{stat}_model_playoff_ridge.pkl.
+    """
+    raw_path = os.path.join("data", "raw", "player_gamelogs_playoffs_historical.csv")
+
+    if os.path.exists(raw_path):
+        logger.info(f"Loading cached playoff logs from {raw_path}")
+    else:
+        logger.info("Fetching playoff game logs for 2022-23, 2023-24, 2024-25...")
+        playoff_df = fetch_player_gamelogs_multiyear(
+            ["2022-23", "2023-24", "2024-25"],
+            season_type="Playoffs",
+        )
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        playoff_df.to_csv(raw_path, index=False)
+        logger.info(f"Saved playoff logs to {raw_path} ({len(playoff_df):,} rows)")
+
+    df = _build_playoff_features(raw_path)
+
+    # Load regular season Ridge for feature importance comparison
+    rs_ridge_path = os.path.join("models", "pts_model_ridge.pkl")
+    rs_ridge = joblib.load(rs_ridge_path) if os.path.exists(rs_ridge_path) else None
+
+    # Playoff data has two NaN sources:
+    # 1. Rolling-window features (L10/L20) are NaN for early games per player
+    #    -> forward-fill within each player's game sequence
+    # 2. Pace/defensive join features are all-NaN because playoff team IDs
+    #    don't match regular-season team logs -> fill with 0
+    # Collect every column that will actually be used as a feature.
+    all_feature_cols = set()
+    for cfg in STAT_CONFIGS.values():
+        all_feature_cols.update(cfg["features"])
+    all_feature_cols = [c for c in all_feature_cols if c in df.columns]
+
+    # Step 1: within-player forward-fill for rolling averages
+    roll_cols = [c for c in all_feature_cols if "_avg_L" in c or "_per36_avg" in c]
+    if roll_cols:
+        df[roll_cols] = (
+            df.sort_values("GAME_DATE")
+            .groupby("PLAYER_NAME")[roll_cols]
+            .transform(lambda s: s.ffill().bfill())
+        )
+
+    # Step 2: remaining NaN -> median; if whole column is NaN -> 0
+    for col in all_feature_cols:
+        if df[col].isna().any():
+            median_val = df[col].median()
+            df[col] = df[col].fillna(0.0 if pd.isna(median_val) else median_val)
+
+    remaining = sum(df[c].isna().sum() for c in all_feature_cols)
+    logger.info(f"NaN fill complete. Remaining NaN in feature cols: {remaining}")
+
+    os.makedirs("models", exist_ok=True)
+
+    for stat, config in STAT_CONFIGS.items():
+        features = config["features"]
+        available = [f for f in features if f in df.columns]
+        missing = set(features) - set(available)
+        if missing:
+            logger.warning(f"{stat}: missing features dropped: {missing}")
+
+        subset = df[available + [stat]].dropna()
+        X = subset[available]
+        y = subset[stat]
+
+        logger.info(f"Training playoff {stat} Ridge on {len(X):,} rows...")
+
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("ridge",  Ridge(alpha=1.0)),
+        ])
+        model.fit(X, y)
+
+        preds = model.predict(X)
+        mae = mean_absolute_error(y, preds)
+        logger.info(f"  {stat} MAE on playoff training set: {mae:.2f}")
+        print(f"{stat} MAE on playoff training set: {mae:.2f}")
+
+        pkl_path = os.path.join("models", f"{stat.lower()}_model_playoff_ridge.pkl")
+        joblib.dump(model, pkl_path)
+        logger.info(f"  Saved -> {pkl_path}")
+
+        # Feature importance: abs(coef) from the Ridge step
+        if stat == "PTS":
+            coefs = pd.Series(
+                np.abs(model.named_steps["ridge"].coef_),
+                index=available,
+            ).sort_values(ascending=False)
+            print("\nTop 5 PTS features — Playoff model:")
+            for feat, val in coefs.head(5).items():
+                print(f"  {feat:<35} {val:.4f}")
+
+            if rs_ridge is not None:
+                rs_coefs = pd.Series(
+                    np.abs(rs_ridge.named_steps["ridge"].coef_),
+                    index=rs_ridge.named_steps["ridge"].coef_.shape[0] * [None],
+                )
+                # Re-index using the feature names the RS model was trained on
+                # (stored implicitly via the scaler's feature names if sklearn >= 1.0)
+                try:
+                    rs_feat_names = rs_ridge.named_steps["scaler"].feature_names_in_.tolist()
+                    rs_coefs = pd.Series(
+                        np.abs(rs_ridge.named_steps["ridge"].coef_),
+                        index=rs_feat_names,
+                    ).sort_values(ascending=False)
+                    print("\nTop 5 PTS features — Regular Season model:")
+                    for feat, val in rs_coefs.head(5).items():
+                        print(f"  {feat:<35} {val:.4f}")
+                except AttributeError:
+                    logger.warning("Regular season scaler has no feature_names_in_ -- skipping RS comparison.")
 
 
 # ─────────────────────────────────────────────
