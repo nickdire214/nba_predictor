@@ -699,6 +699,110 @@ def is_playoff_date(game_date: str = None) -> bool:
         return False
 
 
+def get_series_game_numbers(game_date: str) -> dict:
+    """
+    Return a dict mapping gameId -> seriesGameNumber string (e.g. 'Game 6')
+    for all playoff games on game_date.
+    """
+    try:
+        board = scoreboardv3.ScoreboardV3(game_date=game_date)
+        for df in board.get_data_frames():
+            if "seriesGameNumber" in df.columns and "gameId" in df.columns:
+                playoff_only = df[df["gameId"].astype(str).str.startswith("004")]
+                return dict(zip(
+                    playoff_only["gameId"].astype(str),
+                    playoff_only["seriesGameNumber"].astype(str),
+                ))
+        return {}
+    except Exception as e:
+        logger.warning(f"Could not fetch series game numbers: {e}")
+        return {}
+
+
+def apply_game67_elevation(results: pd.DataFrame, game_date: str) -> pd.DataFrame:
+    """
+    Apply a PTS boost for players in Game 6 or Game 7 series.
+    Boost size is tiered by Vegas line (proxy for player importance).
+    No-Vegas players receive a moderate fixed boost.
+    Only called when is_playoff_date() is True.
+    """
+    series_games = get_series_game_numbers(game_date)
+    if not series_games:
+        logger.info("No series game number data available -- skipping Game 6/7 elevation.")
+        return results
+
+    late_game_ids = {
+        gid for gid, label in series_games.items()
+        if label in ("Game 6", "Game 7")
+    }
+    if not late_game_ids:
+        logger.info("No Game 6 or Game 7 today -- skipping Game 6/7 elevation.")
+        return results
+
+    # Build set of team tricodes playing in a Game 6/7 today.
+    # gameCode format: YYYYMMDD/AWAYHHOME  e.g. 20260502/PHIBOS
+    late_game_teams: set = set()
+    late_game_info: list = []
+    try:
+        board = scoreboardv3.ScoreboardV3(game_date=game_date)
+        for df in board.get_data_frames():
+            if "gameId" in df.columns and "gameCode" in df.columns and "seriesGameNumber" in df.columns:
+                for _, row in df.iterrows():
+                    if str(row["gameId"]) in late_game_ids:
+                        code = str(row["gameCode"]).split("/")[-1]
+                        away, home = code[:3], code[3:]
+                        late_game_teams.update([away, home])
+                        late_game_info.append(
+                            f"{row['seriesGameNumber']}: {away} vs {home}"
+                        )
+                break
+    except Exception as e:
+        logger.warning(f"Could not resolve team tricodes for Game 6/7: {e}")
+        return results
+
+    if not late_game_teams:
+        return results
+
+    results = results.copy()
+
+    import unicodedata as _ud
+    def _ascii(n):
+        return _ud.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+
+    n_boosted = 0
+    for idx, row in results.iterrows():
+        team = str(row.get("TEAM_ABBREVIATION", row.get("TEAM_TRICODE", "")))
+        if team not in late_game_teams:
+            continue
+
+        vegas = row.get("VEGAS_PTS", float("nan"))
+        if pd.notna(vegas):
+            if vegas >= 20:
+                boost = 3.0
+            elif vegas >= 15:
+                boost = 2.0
+            elif vegas >= 10:
+                boost = 1.0
+            else:
+                boost = 0.0
+        else:
+            boost = 1.5
+
+        if boost == 0.0:
+            continue
+
+        n_boosted += 1
+        for col in ["PTS_PRED", "PTS_LOW", "PTS_HIGH"]:
+            if col in results.columns and pd.notna(results.at[idx, col]):
+                results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + boost), 1)
+
+    logger.info(f"Game 6/7 elevation applied: {n_boosted} players")
+    for info in late_game_info:
+        logger.info(f"  {info}")
+
+    return results
+
+
 def apply_playoff_rotation_filter(results: pd.DataFrame) -> pd.DataFrame:
     """
     Playoff-only filter: remove players where Vegas has set a line below 8.0 PTS
@@ -944,9 +1048,10 @@ if __name__ == "__main__":
             )
             results = merge_vegas_lines(results)
             if playoff:
-                logger.info("Playoff games detected -- applying elevation, series adjustment, and rotation filter.")
+                logger.info("Playoff games detected -- applying elevation, series adjustment, game 6/7 boost, and rotation filter.")
                 results = apply_playoff_elevation(results)
                 results = apply_series_adjustment(results, date_str)
+                results = apply_game67_elevation(results, date_str)
                 results = apply_playoff_rotation_filter(results)
             else:
                 logger.info("Regular season games -- skipping playoff adjustments.")
