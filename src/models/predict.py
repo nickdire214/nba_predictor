@@ -273,6 +273,42 @@ def build_prediction_input(game_date: str = None):
     latest_per_player["IS_BACK_TO_BACK"] = (days_rest == 0).astype(int)
     latest_per_player["IS_WELL_RESTED"] = (days_rest >= 3).astype(int)
 
+    # Fix rest days using current-season playoff logs.
+    # The feature matrix ends at the regular season so playoff players
+    # show 14+ days rest. Override with actual last playoff game date.
+    try:
+        from src.ingestion.nba_stats import fetch_player_gamelogs as _fetch_po_logs
+        playoff_recent = _fetch_po_logs(season="2025-26", season_type="Playoffs")
+        if not playoff_recent.empty:
+            playoff_recent["GAME_DATE"] = pd.to_datetime(playoff_recent["GAME_DATE"])
+            playoff_recent["_name_ascii"] = playoff_recent["PLAYER_NAME"].apply(
+                lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+            )
+            latest_playoff = (
+                playoff_recent.sort_values("GAME_DATE")
+                .groupby("_name_ascii")["GAME_DATE"]
+                .last()
+            )
+            latest_per_player["_name_ascii"] = latest_per_player["PLAYER_NAME"].apply(
+                lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+            )
+            n_updated = 0
+            for idx, row in latest_per_player.iterrows():
+                key = row["_name_ascii"]
+                if key not in latest_playoff.index:
+                    continue
+                po_date = latest_playoff[key]
+                if po_date > row["GAME_DATE"]:
+                    new_rest = int(min(14, max(0, (today - po_date).days - 1)))
+                    latest_per_player.at[idx, "DAYS_REST"] = new_rest
+                    latest_per_player.at[idx, "IS_BACK_TO_BACK"] = int(new_rest == 0)
+                    latest_per_player.at[idx, "IS_WELL_RESTED"] = int(new_rest >= 3)
+                    n_updated += 1
+            latest_per_player = latest_per_player.drop(columns=["_name_ascii"])
+            logger.info(f"Updated rest days for {n_updated} players using recent playoff game logs")
+    except Exception as e:
+        logger.warning(f"Could not update rest days from playoff logs: {e}")
+
     # Overwrite MATCHUP and IS_HOME with tonight's actual game data
     if "away_tri" in games_df.columns and "home_tri" in games_df.columns:
         matchup_map = {}
