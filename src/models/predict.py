@@ -636,10 +636,12 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
 
 
 def _series_weight(games: int) -> float:
-    if games >= 5:
-        return 0.25
+    if games >= 6:
+        return 0.45
+    if games == 5:
+        return 0.35
     if games == 4:
-        return 0.20
+        return 0.25
     if games == 3:
         return 0.15
     if games == 2:
@@ -669,7 +671,7 @@ def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFra
     results["_name_ascii"] = results["PLAYER_NAME"].apply(_ascii)
     series_idx = series.set_index("PLAYER_NAME_ASCII")
 
-    tier_pts = {"5+": [], "4": [], "3": [], "2": []}
+    tier_pts = {"6+": [], "5": [], "4": [], "3": [], "2": []}
 
     for idx, row in results.iterrows():
         key = row["_name_ascii"]
@@ -682,8 +684,10 @@ def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFra
         if weight == 0.0:
             continue
 
-        if games >= 5:
-            bucket = "5+"
+        if games >= 6:
+            bucket = "6+"
+        elif games == 5:
+            bucket = "5"
         elif games == 4:
             bucket = "4"
         elif games == 3:
@@ -708,7 +712,7 @@ def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFra
     total = sum(len(v) for v in tier_pts.values())
     logger.info(f"Series adjustment applied: {total} players")
 
-    labels = [("5+", "5+ games"), ("4", "4 games"), ("3", "3 games"), ("2", "2 games")]
+    labels = [("6+", "6+ games"), ("5", "5 games"), ("4", "4 games"), ("3", "3 games"), ("2", "2 games")]
     for key, label in labels:
         vals = tier_pts[key]
         if vals:
