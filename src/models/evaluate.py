@@ -69,16 +69,14 @@ def fetch_actuals(date_str: str) -> pd.DataFrame:
                 date_to_nullable=date_fmt,
             )
             df = logs.get_data_frames()[0]
+            if not df.empty:
+                df["PLAYER_NAME_ASCII"] = df["PLAYER_NAME"].apply(_ascii)
+                logger.info(f"Fetched {len(df)} rows for {date_str} ({season_type})")
+                return df
+            logger.info(f"No data for {date_str} ({season_type}), trying next...")
         except Exception as e:
-            logger.error(f"Failed to fetch actuals ({season_type}): {e}")
-            raise
-
-        if not df.empty:
-            df["PLAYER_NAME_ASCII"] = df["PLAYER_NAME"].apply(_ascii)
-            logger.info(f"Fetched {len(df)} rows for {date_str} ({season_type})")
-            return df
-
-        logger.info(f"No data for {date_str} ({season_type}), trying next...")
+            logger.warning(f"No data for {date_str} ({season_type}): {e}, trying next...")
+            continue
 
     logger.warning(f"No box score data returned for {date_str} (Regular Season or Playoffs).")
     return pd.DataFrame()
