@@ -41,8 +41,11 @@ def _bias(series: pd.Series) -> float:
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_predictions(date_str: str) -> pd.DataFrame:
-    path = os.path.join("data", "predictions", f"predictions_{date_str}.csv")
+def load_predictions(date_str: str, filename: str = None) -> pd.DataFrame:
+    if filename:
+        path = os.path.join("data", "predictions", filename)
+    else:
+        path = os.path.join("data", "predictions", f"predictions_{date_str}.csv")
     if not os.path.exists(path):
         raise FileNotFoundError(f"No predictions file: {path}")
     df = pd.read_csv(path)
@@ -282,7 +285,14 @@ if __name__ == "__main__":
         print(f"Invalid date format: {date_arg}  (expected YYYY-MM-DD)")
         sys.exit(1)
 
-    preds   = load_predictions(date_arg)
+    # Optional --predictions-file FILENAME overrides the default predictions path
+    pred_file = None
+    if "--predictions-file" in sys.argv:
+        idx = sys.argv.index("--predictions-file")
+        if idx + 1 < len(sys.argv):
+            pred_file = sys.argv[idx + 1]
+
+    preds   = load_predictions(date_arg, filename=pred_file)
     actuals = fetch_actuals(date_arg)
 
     if actuals.empty:

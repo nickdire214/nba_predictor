@@ -459,27 +459,37 @@ _PLAYOFF_EXTRA_PO = {
     "AST": 0.10,
 }
 
+# Fixed calibration for apples-to-apples model comparison runs.
+# Midpoint between playoff-model and regular-model offsets.
+_FIXED_CALIBRATION = {
+    "PTS": 1.50,
+    "REB": 0.10,
+    "AST": 0.20,
+}
+
 
 def apply_calibration(
     results: pd.DataFrame,
     is_playoff: bool = False,
     use_playoff_model: bool = False,
+    fixed_calibration: bool = False,
 ) -> pd.DataFrame:
     """
     Subtract known positive bias from predictions and quantile bounds,
     then clip each prediction to stay within its own p10-p90 interval.
-    When is_playoff=True, applies an additional playoff offset.
-    When use_playoff_model=True the reduced offset is used since the
-    playoff model already captures playoff scoring patterns.
+    When fixed_calibration=True, uses a single shared offset regardless
+    of which model is active (for apples-to-apples model comparison).
     """
-    if is_playoff:
+    if fixed_calibration:
+        offsets = dict(_FIXED_CALIBRATION)
+        logger.info(
+            f"Fixed calibration (comparison mode): PTS -{offsets['PTS']:.2f} "
+            f"REB -{offsets['REB']:.2f} "
+            f"AST -{offsets['AST']:.2f}"
+        )
+    elif is_playoff:
         extra = _PLAYOFF_EXTRA_PO if use_playoff_model else _PLAYOFF_EXTRA_RS
-    else:
-        extra = {"PTS": 0.0, "REB": 0.0, "AST": 0.0}
-
-    offsets = {stat: _CALIBRATION[stat] + extra[stat] for stat in _CALIBRATION}
-
-    if is_playoff:
+        offsets = {stat: _CALIBRATION[stat] + extra[stat] for stat in _CALIBRATION}
         label = "playoff model" if use_playoff_model else "regular model"
         logger.info(
             f"Playoff calibration ({label}): PTS -{offsets['PTS']:.2f} "
@@ -487,6 +497,7 @@ def apply_calibration(
             f"AST -{offsets['AST']:.2f}"
         )
     else:
+        offsets = {stat: _CALIBRATION[stat] for stat in _CALIBRATION}
         logger.info(
             f"Regular season calibration: PTS -{offsets['PTS']:.2f} "
             f"REB -{offsets['REB']:.2f} "
@@ -1057,9 +1068,10 @@ def display_predictions(results: pd.DataFrame, min_pts: float = 8.0, game_date: 
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    game_date        = sys.argv[1] if len(sys.argv) > 1 else None
-    season           = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
-    no_playoff_model = "--no-playoff-model" in sys.argv
+    game_date         = sys.argv[1] if len(sys.argv) > 1 else None
+    season            = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
+    no_playoff_model  = "--no-playoff-model" in sys.argv
+    fixed_calibration = "--fixed-calibration" in sys.argv
 
     date_str = game_date or datetime.now().strftime("%Y-%m-%d")
     playoff  = is_playoff_date(date_str)
@@ -1085,6 +1097,7 @@ if __name__ == "__main__":
                 results,
                 is_playoff=playoff,
                 use_playoff_model=used_playoff_model,
+                fixed_calibration=fixed_calibration,
             )
             results = merge_vegas_lines(results)
             if playoff:
@@ -1095,6 +1108,9 @@ if __name__ == "__main__":
                 results = apply_playoff_rotation_filter(results)
             else:
                 logger.info("Regular season games -- skipping playoff adjustments.")
-            suffix = "_regular_model" if no_playoff_model else ""
+            if fixed_calibration:
+                suffix = "_regular_fixed" if no_playoff_model else "_playoff_fixed"
+            else:
+                suffix = "_regular_model" if no_playoff_model else ""
             save_predictions(results, date_str, suffix=suffix)
             display_predictions(results, min_pts=8.0, game_date=date_str)
