@@ -36,33 +36,50 @@ def get_recently_active_players(team_ids: list, n_games: int = 3) -> set:
 
     A player who hasn't appeared in the last 3 team games is
     flagged as likely inactive — injured, IR, or load managed.
+    Also supplements with current-season playoff logs so that
+    playoff players are not incorrectly marked inactive when the
+    feature matrix ends at the regular season.
     Returns a set of player IDs who have appeared recently.
     """
     pattern = os.path.join("data", "raw", "player_gamelogs_*.csv")
     files = sorted(glob.glob(pattern))
 
-    if not files:
-        logger.warning("No player game log files found — skipping activity check.")
-        return set()
-
-    df = pd.read_csv(files[-1])
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df[df["TEAM_ID"].isin(team_ids)]
-
     recently_active = set()
 
-    for team_id in team_ids:
-        team_df = df[df["TEAM_ID"] == team_id].sort_values("GAME_DATE")
+    if not files:
+        logger.warning("No player game log files found — skipping feature-matrix activity check.")
+    else:
+        df = pd.read_csv(files[-1])
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+        df = df[df["TEAM_ID"].isin(team_ids)]
 
-        # Get the last N unique game dates for this team
-        recent_dates = team_df["GAME_DATE"].unique()[-n_games:]
-        recent_games = team_df[team_df["GAME_DATE"].isin(recent_dates)]
+        for team_id in team_ids:
+            team_df = df[df["TEAM_ID"] == team_id].sort_values("GAME_DATE")
+            recent_dates = team_df["GAME_DATE"].unique()[-n_games:]
+            recent_games = team_df[team_df["GAME_DATE"].isin(recent_dates)]
+            recently_active.update(recent_games["PLAYER_ID"].tolist())
 
-        # Players who appeared in at least one of those games
-        active_ids = set(recent_games["PLAYER_ID"].tolist())
-        recently_active.update(active_ids)
+    n_from_matrix = len(recently_active)
+    logger.info(f"Players active from feature matrix: {n_from_matrix}")
 
-    logger.info(f"Players active in last {n_games} games: {len(recently_active)}")
+    # Supplement with current-season playoff logs so playoff players
+    # who last appeared after the feature matrix cutoff are not dropped.
+    try:
+        from src.ingestion.nba_stats import fetch_player_gamelogs
+        playoff_logs = fetch_player_gamelogs(season="2025-26", season_type="Playoffs")
+        if not playoff_logs.empty:
+            po_ids = set(
+                playoff_logs[playoff_logs["TEAM_ID"].isin(team_ids)]["PLAYER_ID"].tolist()
+            )
+            new_ids = po_ids - recently_active
+            recently_active.update(po_ids)
+            logger.info(f"Players added from 2025-26 playoff logs: {len(new_ids)}")
+        else:
+            logger.info("Players added from 2025-26 playoff logs: 0 (no data)")
+    except Exception as e:
+        logger.warning(f"Could not fetch playoff logs for activity check: {e}")
+
+    logger.info(f"Total active players: {len(recently_active)}")
     return recently_active
 
 
