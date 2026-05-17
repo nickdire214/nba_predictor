@@ -46,16 +46,26 @@ def fetch_player_props(sport: str = "basketball_nba") -> pd.DataFrame:
         raise EnvironmentError("ODDS_API_KEY not set in environment / .env")
 
     # ── Step 1: fetch today's events ───────────────────────────────────────
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
-    tomorrow = datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z")
+    # Games are scheduled in US Eastern time. ET is UTC-4 (EDT) or UTC-5 (EST).
+    # To avoid missing late games that cross midnight UTC, we query a 30-hour
+    # window: today 00:00 ET (= 04:00 UTC) to tomorrow 06:00 ET (= 10:00 UTC).
+    # This safely covers any tip-off on the ET calendar date.
+    from datetime import timedelta, timezone as _tz
+    ET_OFFSET = timedelta(hours=4)  # EDT (UTC-4); conservative — misses nothing
+    now_et = datetime.now(_tz.utc) - ET_OFFSET
+    today_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start = (today_et + ET_OFFSET)               # today 00:00 ET in UTC
+    window_end   = (today_et + timedelta(hours=30) + ET_OFFSET)  # +30h covers next-day UTC overflow
+    commence_from = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    commence_to   = window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    logger.info("Fetching NBA events from Odds API...")
+    logger.info(f"Fetching NBA events from Odds API (window: {commence_from} to {commence_to} UTC)...")
     try:
         events = _get(EVENTS_URL, {
             "apiKey":        api_key,
             "sport":         sport,
-            "commenceTimeFrom": today,
-            "commenceTimeTo":   tomorrow,
+            "commenceTimeFrom": commence_from,
+            "commenceTimeTo":   commence_to,
         })
     except Exception as e:
         logger.error(f"Failed to fetch events: {e}")
