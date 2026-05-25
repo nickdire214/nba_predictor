@@ -648,15 +648,15 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
 
 def _series_weight(games: int) -> float:
     if games >= 6:
-        return 0.45
+        return 0.50
     if games == 5:
-        return 0.35
+        return 0.40
     if games == 4:
-        return 0.25
+        return 0.30
     if games == 3:
-        return 0.15
+        return 0.25
     if games == 2:
-        return 0.10
+        return 0.15
     return 0.00
 
 
@@ -772,53 +772,81 @@ def get_series_game_numbers(game_date: str) -> dict:
 
 def apply_game67_elevation(results: pd.DataFrame, game_date: str) -> pd.DataFrame:
     """
-    Apply a PTS boost for players in Game 6 or Game 7 series.
+    Apply a PTS boost for players in Game 6, Game 7, or elimination games
+    (series score 3-0 or 3-1 against the trailing team).
     Boost size is tiered by Vegas line (proxy for player importance).
     No-Vegas players receive a moderate fixed boost.
     Only called when is_playoff_date() is True.
     """
-    series_games = get_series_game_numbers(game_date)
-    if not series_games:
-        logger.info("No series game number data available -- skipping Game 6/7 elevation.")
-        return results
-
-    late_game_ids = {
-        gid for gid, label in series_games.items()
-        if label in ("Game 6", "Game 7")
-    }
-    if not late_game_ids:
-        logger.info("No Game 6 or Game 7 today -- skipping Game 6/7 elevation.")
-        return results
-
-    # Build set of team tricodes playing in a Game 6/7 today.
-    # gameCode format: YYYYMMDD/AWAYHHOME  e.g. 20260502/PHIBOS
-    late_game_teams: set = set()
-    late_game_info: list = []
     try:
         board = scoreboardv3.ScoreboardV3(game_date=game_date)
-        for df in board.get_data_frames():
-            if "gameId" in df.columns and "gameCode" in df.columns and "seriesGameNumber" in df.columns:
-                for _, row in df.iterrows():
-                    if str(row["gameId"]) in late_game_ids:
-                        code = str(row["gameCode"]).split("/")[-1]
-                        away, home = code[:3], code[3:]
-                        late_game_teams.update([away, home])
-                        late_game_info.append(
-                            f"{row['seriesGameNumber']}: {away} vs {home}"
-                        )
-                break
+        all_dfs = board.get_data_frames()
     except Exception as e:
-        logger.warning(f"Could not resolve team tricodes for Game 6/7: {e}")
+        logger.warning(f"Could not fetch scoreboard for Game 6/7/elimination check: {e}")
         return results
 
+    # Extract seriesGameNumber and gameCode from whichever DataFrame has them
+    series_labels: dict = {}   # gameId -> "Game 6" / "Game 7" / etc.
+    game_codes: dict   = {}    # gameId -> "AWAYHHOME"
+    for df in all_dfs:
+        if "seriesGameNumber" in df.columns and "gameId" in df.columns and "gameCode" in df.columns:
+            for _, row in df.iterrows():
+                gid = str(row["gameId"])
+                if gid.startswith("004"):
+                    series_labels[gid] = str(row["seriesGameNumber"])
+                    game_codes[gid]    = str(row["gameCode"]).split("/")[-1]
+            break
+
+    if not series_labels:
+        logger.info("No series game number data available -- skipping Game 6/7/elimination elevation.")
+        return results
+
+    # Extract wins per team from whichever DataFrame has them
+    # Expected columns: gameId, teamTricode, wins, losses
+    wins_by_game: dict = {}   # gameId -> list of (tricode, wins)
+    for df in all_dfs:
+        if "wins" in df.columns and "teamTricode" in df.columns and "gameId" in df.columns:
+            for _, row in df.iterrows():
+                gid = str(row["gameId"])
+                if gid.startswith("004"):
+                    wins_by_game.setdefault(gid, []).append(
+                        (str(row["teamTricode"]), int(row["wins"]))
+                    )
+            break
+
+    # Classify each playoff game as qualifying (Game 6/7 or elimination)
+    late_game_teams: set = set()
+    late_game_info: list = []
+
+    for gid, label in series_labels.items():
+        code = game_codes.get(gid, "")
+        away = code[:3] if len(code) >= 6 else "???"
+        home = code[3:] if len(code) >= 6 else "???"
+
+        reason = None
+        if label in ("Game 6", "Game 7"):
+            reason = label
+        else:
+            teams_wins = wins_by_game.get(gid, [])
+            if len(teams_wins) >= 2:
+                win_counts = [w for _, w in teams_wins]
+                max_w, min_w = max(win_counts), min(win_counts)
+                if max_w == 3 and min_w == 0:
+                    reason = "elimination 3-0"
+                elif max_w == 3 and min_w == 1:
+                    reason = "elimination 3-1"
+
+        if reason is None:
+            continue
+
+        late_game_teams.update([away, home])
+        late_game_info.append((reason, away, home))
+
     if not late_game_teams:
+        logger.info("No Game 6, Game 7, or elimination games today -- skipping elevation.")
         return results
 
     results = results.copy()
-
-    import unicodedata as _ud
-    def _ascii(n):
-        return _ud.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
 
     n_boosted = 0
     for idx, row in results.iterrows():
@@ -847,9 +875,9 @@ def apply_game67_elevation(results: pd.DataFrame, game_date: str) -> pd.DataFram
             if col in results.columns and pd.notna(results.at[idx, col]):
                 results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + boost), 1)
 
-    logger.info(f"Game 6/7 elevation applied: {n_boosted} players")
-    for info in late_game_info:
-        logger.info(f"  {info}")
+    logger.info(f"Game 6/7 or elimination elevation applied: {n_boosted} players")
+    for reason, away, home in late_game_info:
+        logger.info(f"  {away} vs {home} (reason: {reason})")
 
     return results
 
