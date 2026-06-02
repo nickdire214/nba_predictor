@@ -276,6 +276,8 @@ def build_prediction_input(game_date: str = None):
     # Fix rest days using current-season playoff logs.
     # The feature matrix ends at the regular season so playoff players
     # show 14+ days rest. Override with actual last playoff game date.
+    # playoff_recent is hoisted outside the try so the rolling avg block can reuse it.
+    playoff_recent = pd.DataFrame()
     try:
         from src.ingestion.nba_stats import fetch_player_gamelogs as _fetch_po_logs
         playoff_recent = _fetch_po_logs(season="2025-26", season_type="Playoffs")
@@ -308,6 +310,69 @@ def build_prediction_input(game_date: str = None):
             logger.info(f"Updated rest days for {n_updated} players using recent playoff game logs")
     except Exception as e:
         logger.warning(f"Could not update rest days from playoff logs: {e}")
+
+    # Update rolling averages using current-season playoff logs.
+    # For players with 3+ playoff games, overwrite L5/L10 averages so the model
+    # sees actual playoff performance rather than stale regular-season numbers.
+    # L20 is intentionally kept as the regular-season baseline.
+    if not playoff_recent.empty:
+        try:
+            po = playoff_recent.copy()
+            if "_name_ascii" not in po.columns:
+                po["_name_ascii"] = po["PLAYER_NAME"].apply(
+                    lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+                )
+            po = po.sort_values(["_name_ascii", "GAME_DATE"])
+
+            latest_per_player["_name_ascii"] = latest_per_player["PLAYER_NAME"].apply(
+                lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+            )
+
+            n_avg_updated = 0
+            changes = []
+
+            for key, group in po.groupby("_name_ascii"):
+                if len(group) < 3:
+                    continue
+                mask = latest_per_player["_name_ascii"] == key
+                if not mask.any():
+                    continue
+
+                recent5  = group.tail(5)
+                recent10 = group.tail(10)
+
+                updates = {
+                    "PTS_avg_L5":  round(float(recent5["PTS"].mean()),  2),
+                    "PTS_avg_L10": round(float(recent10["PTS"].mean()), 2),
+                    "REB_avg_L5":  round(float(recent5["REB"].mean()),  2),
+                    "REB_avg_L10": round(float(recent10["REB"].mean()), 2),
+                    "AST_avg_L5":  round(float(recent5["AST"].mean()),  2),
+                    "AST_avg_L10": round(float(recent10["AST"].mean()), 2),
+                }
+
+                idx_list = latest_per_player.index[mask].tolist()
+                old_pts = (
+                    float(latest_per_player.loc[idx_list[0], "PTS_avg_L5"])
+                    if "PTS_avg_L5" in latest_per_player.columns else float("nan")
+                )
+
+                for col, val in updates.items():
+                    if col in latest_per_player.columns:
+                        latest_per_player.loc[mask, col] = val
+
+                n_avg_updated += 1
+                changes.append((group["PLAYER_NAME"].iloc[0], old_pts, updates["PTS_avg_L5"], len(group)))
+
+            latest_per_player = latest_per_player.drop(columns=["_name_ascii"])
+            logger.info(
+                f"Playoff rolling averages updated for {n_avg_updated} players "
+                f"using current season playoff logs"
+            )
+            changes.sort(key=lambda x: abs(x[2] - x[1]) if x[1] == x[1] else 0, reverse=True)
+            for name, old_v, new_v, ngames in changes[:5]:
+                logger.info(f"  {name}: {old_v:.1f} -> {new_v:.1f} (statPTS, {ngames} playoff games)")
+        except Exception as e:
+            logger.warning(f"Could not update rolling averages from playoff logs: {e}")
 
     # Overwrite MATCHUP and IS_HOME with tonight's actual game data
     if "away_tri" in games_df.columns and "home_tri" in games_df.columns:
