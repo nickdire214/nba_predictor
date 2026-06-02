@@ -103,6 +103,9 @@ def get_series_adjustments(game_date: str, features_path: str = None) -> pd.Data
         .round(2)
     )
 
+    # Track team per player for teammate absorption calculation
+    team_map = series_df.groupby("PLAYER_NAME_ASCII")["TEAM_ABBREVIATION"].last()
+
     # Load L10 baseline from feature matrix
     if not os.path.exists(features_path):
         logger.warning(f"Feature matrix not found at {features_path} -- deltas will be 0.")
@@ -130,10 +133,22 @@ def get_series_adjustments(game_date: str, features_path: str = None) -> pd.Data
     few_games = merged["SERIES_GAMES"] < 2
     merged.loc[few_games, ["SERIES_PTS_DELTA", "SERIES_REB_DELTA", "SERIES_AST_DELTA"]] = 0.0
 
+    # Compute teammate series absorption: for each player, sum the positive
+    # SERIES_PTS_DELTA of teammates (same team) who are running hot (delta > 3.0).
+    merged["TEAM_ABBREVIATION"] = team_map
+    absorption = {}
+    for player_key, row in merged.iterrows():
+        team = row["TEAM_ABBREVIATION"]
+        teammates = merged[(merged["TEAM_ABBREVIATION"] == team) & (merged.index != player_key)]
+        hot_sum = float(teammates.loc[teammates["SERIES_PTS_DELTA"] > 3.0, "SERIES_PTS_DELTA"].sum())
+        absorption[player_key] = round(hot_sum, 2)
+    merged["TEAMMATE_SERIES_ABSORPTION"] = pd.Series(absorption)
+
     result = merged[[
         "SERIES_GAMES",
         "SERIES_PTS_AVG", "SERIES_REB_AVG", "SERIES_AST_AVG",
         "SERIES_PTS_DELTA", "SERIES_REB_DELTA", "SERIES_AST_DELTA",
+        "TEAMMATE_SERIES_ABSORPTION",
     ]].reset_index()
 
     n_qualified = int((result["SERIES_GAMES"] >= 2).sum())

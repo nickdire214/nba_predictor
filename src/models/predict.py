@@ -648,11 +648,11 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
 
 def _series_weight(games: int) -> float:
     if games >= 6:
-        return 0.50
+        return 0.65
     if games == 5:
-        return 0.40
+        return 0.55
     if games == 4:
-        return 0.30
+        return 0.45
     if games == 3:
         return 0.25
     if games == 2:
@@ -660,10 +660,19 @@ def _series_weight(games: int) -> float:
     return 0.00
 
 
-def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFrame:
+def apply_series_adjustment(
+    results: pd.DataFrame,
+    game_date: str,
+    use_redistribution: bool = True,
+    is_elimination: bool = False,
+) -> pd.DataFrame:
     """
     For each player with 2+ games in the current series, apply a tiered weight
     (based on series games played) to their in-series PTS/REB/AST delta.
+
+    When use_redistribution=True, also applies an extra downward adjustment for
+    players who are running cold (SERIES_PTS_DELTA < -3.0) while teammates are
+    absorbing usage (TEAMMATE_SERIES_ABSORPTION > 3.0).
     Only called when is_playoff_date() is True.
     """
     from src.ingestion.series_stats import get_series_adjustments
@@ -718,8 +727,6 @@ def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFra
                 if col in results.columns and pd.notna(results.at[idx, col]):
                     results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + delta), 1)
 
-    results = results.drop(columns=["_name_ascii"])
-
     total = sum(len(v) for v in tier_pts.values())
     logger.info(f"Series adjustment applied: {total} players")
 
@@ -730,6 +737,39 @@ def apply_series_adjustment(results: pd.DataFrame, game_date: str) -> pd.DataFra
             avg = sum(vals) / len(vals)
             logger.info(f"  {label}: {len(vals)} players avg {avg:+.1f} pts")
 
+    # Teammate usage redistribution: amplify downward adjustment for cold players
+    # whose teammates are absorbing usage. Suppressed in Game 7/elimination games
+    # where stars override defensive schemes and usage patterns are less predictive.
+    if use_redistribution and is_elimination:
+        logger.info("Usage redistribution skipped (Game 7/elimination -- stars override defensive schemes)")
+    elif use_redistribution and "TEAMMATE_SERIES_ABSORPTION" in series_idx.columns:
+        extra_adjustments = []
+        for idx, row in results.iterrows():
+            key = row["_name_ascii"]
+            if key not in series_idx.index:
+                continue
+            player_series = series_idx.loc[key]
+            pts_delta    = float(player_series["SERIES_PTS_DELTA"])
+            absorption   = float(player_series.get("TEAMMATE_SERIES_ABSORPTION", 0.0))
+            if pts_delta < -3.0 and absorption > 3.0:
+                extra_down = min(absorption * 0.15, 3.0)
+                extra_adjustments.append(extra_down)
+                col = "PTS_PRED"
+                if col in results.columns and pd.notna(results.at[idx, col]):
+                    results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) - extra_down), 1)
+
+        if extra_adjustments:
+            avg_extra = sum(extra_adjustments) / len(extra_adjustments)
+            logger.info(
+                f"Usage redistribution applied: {len(extra_adjustments)} players "
+                f"avg additional adjustment: -{avg_extra:.1f} pts"
+            )
+        else:
+            logger.info("Usage redistribution: no players met criteria (delta < -3.0 with hot teammates).")
+    elif use_redistribution and not is_elimination:
+        logger.info("Usage redistribution: TEAMMATE_SERIES_ABSORPTION not available -- skipping.")
+
+    results = results.drop(columns=["_name_ascii"])
     return results
 
 
@@ -768,6 +808,48 @@ def get_series_game_numbers(game_date: str) -> dict:
     except Exception as e:
         logger.warning(f"Could not fetch series game numbers: {e}")
         return {}
+
+
+def detect_late_game(game_date: str) -> bool:
+    """
+    Return True if any playoff game on game_date is a Game 6, Game 7,
+    or an elimination game (series score 3-0 or 3-1 against trailing team).
+    Uses a single scoreboard fetch; returns False on any error.
+    """
+    try:
+        board = scoreboardv3.ScoreboardV3(game_date=game_date)
+        all_dfs = board.get_data_frames()
+    except Exception as e:
+        logger.warning(f"detect_late_game: scoreboard fetch failed: {e}")
+        return False
+
+    series_labels = {}
+    for df in all_dfs:
+        if "seriesGameNumber" in df.columns and "gameId" in df.columns:
+            for _, row in df.iterrows():
+                gid = str(row["gameId"])
+                if gid.startswith("004"):
+                    series_labels[gid] = str(row["seriesGameNumber"])
+            break
+
+    wins_by_game = {}
+    for df in all_dfs:
+        if "wins" in df.columns and "teamTricode" in df.columns and "gameId" in df.columns:
+            for _, row in df.iterrows():
+                gid = str(row["gameId"])
+                if gid.startswith("004"):
+                    wins_by_game.setdefault(gid, []).append(int(row["wins"]))
+            break
+
+    for gid, label in series_labels.items():
+        if label in ("Game 6", "Game 7"):
+            return True
+        win_counts = wins_by_game.get(gid, [])
+        if len(win_counts) >= 2:
+            max_w, min_w = max(win_counts), min(win_counts)
+            if max_w == 3 and min_w in (0, 1):
+                return True
+    return False
 
 
 def apply_game67_elevation(results: pd.DataFrame, game_date: str) -> pd.DataFrame:
@@ -1100,6 +1182,7 @@ if __name__ == "__main__":
     season            = sys.argv[2] if len(sys.argv) > 2 else "2025-26"
     no_playoff_model  = "--no-playoff-model" in sys.argv
     fixed_calibration = "--fixed-calibration" in sys.argv
+    no_redistribution = "--no-redistribution" in sys.argv
 
     date_str = game_date or datetime.now().strftime("%Y-%m-%d")
     playoff  = is_playoff_date(date_str)
@@ -1130,8 +1213,13 @@ if __name__ == "__main__":
             results = merge_vegas_lines(results)
             if playoff:
                 logger.info("Playoff games detected -- applying elevation, series adjustment, game 6/7 boost, and rotation filter.")
+                is_late_game = detect_late_game(date_str)
                 results = apply_playoff_elevation(results)
-                results = apply_series_adjustment(results, date_str)
+                results = apply_series_adjustment(
+                    results, date_str,
+                    use_redistribution=not no_redistribution,
+                    is_elimination=is_late_game,
+                )
                 results = apply_game67_elevation(results, date_str)
                 results = apply_playoff_rotation_filter(results)
             else:
@@ -1140,5 +1228,7 @@ if __name__ == "__main__":
                 suffix = "_regular_fixed" if no_playoff_model else "_playoff_fixed"
             else:
                 suffix = "_regular_model" if no_playoff_model else ""
+            if no_redistribution:
+                suffix += "_no_redistrib"
             save_predictions(results, date_str, suffix=suffix)
             display_predictions(results, min_pts=8.0, game_date=date_str)
