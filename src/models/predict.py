@@ -315,6 +315,8 @@ def build_prediction_input(game_date: str = None):
     # For players with 3+ playoff games, overwrite L5/L10 averages so the model
     # sees actual playoff performance rather than stale regular-season numbers.
     # L20 is intentionally kept as the regular-season baseline.
+    # playoff_rolling_changes is hoisted so the role change block below can read it.
+    playoff_rolling_changes = []  # (ascii_key, old_pts_l10, new_pts_l5)
     if not playoff_recent.empty:
         try:
             po = playoff_recent.copy()
@@ -351,17 +353,16 @@ def build_prediction_input(game_date: str = None):
                 }
 
                 idx_list = latest_per_player.index[mask].tolist()
-                old_pts = (
-                    float(latest_per_player.loc[idx_list[0], "PTS_avg_L5"])
-                    if "PTS_avg_L5" in latest_per_player.columns else float("nan")
-                )
+                old_pts_l5  = float(latest_per_player.loc[idx_list[0], "PTS_avg_L5"])  if "PTS_avg_L5"  in latest_per_player.columns else float("nan")
+                old_pts_l20 = float(latest_per_player.loc[idx_list[0], "PTS_avg_L20"]) if "PTS_avg_L20" in latest_per_player.columns else float("nan")
 
                 for col, val in updates.items():
                     if col in latest_per_player.columns:
                         latest_per_player.loc[mask, col] = val
 
                 n_avg_updated += 1
-                changes.append((group["PLAYER_NAME"].iloc[0], old_pts, updates["PTS_avg_L5"], len(group)))
+                changes.append((group["PLAYER_NAME"].iloc[0], old_pts_l5, updates["PTS_avg_L5"], len(group)))
+                playoff_rolling_changes.append((key, old_pts_l20, updates["PTS_avg_L5"], len(group)))
 
             latest_per_player = latest_per_player.drop(columns=["_name_ascii"])
             logger.info(
@@ -373,6 +374,31 @@ def build_prediction_input(game_date: str = None):
                 logger.info(f"  {name}: {old_v:.1f} -> {new_v:.1f} (statPTS, {ngames} playoff games)")
         except Exception as e:
             logger.warning(f"Could not update rolling averages from playoff logs: {e}")
+
+    # Role change flag: mark players whose playoff L5 avg diverges from regular
+    # season L10 baseline by more than 8 pts. The adjustment function uses this
+    # to apply an additional post-model correction on top of the rolling avg update.
+    latest_per_player["ROLE_CHANGE_FLAG"]  = 0
+    latest_per_player["ROLE_CHANGE_DELTA"] = 0.0
+    if playoff_rolling_changes:
+        try:
+            _asc = lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+            ascii_to_idx = {_asc(n): i for i, n in latest_per_player["PLAYER_NAME"].items()}
+            n_flagged = 0
+            for key, old_l10, new_l5, ngames in playoff_rolling_changes:
+                if key not in ascii_to_idx or old_l10 != old_l10:  # nan check
+                    continue
+                if ngames < 5:
+                    continue
+                delta = new_l5 - old_l10
+                if abs(delta) > 6.0:
+                    idx = ascii_to_idx[key]
+                    latest_per_player.at[idx, "ROLE_CHANGE_FLAG"]  = 1
+                    latest_per_player.at[idx, "ROLE_CHANGE_DELTA"] = round(delta, 2)
+                    n_flagged += 1
+            logger.info(f"Role change flag: {n_flagged} players flagged (|playoff_L5 - reg_L20| > 6.0 pts, 5+ games)")
+        except Exception as e:
+            logger.warning(f"Could not compute role change flags: {e}")
 
     # Overwrite MATCHUP and IS_HOME with tonight's actual game data
     if "away_tri" in games_df.columns and "home_tri" in games_df.columns:
@@ -459,8 +485,9 @@ def generate_predictions(models: dict, player_df: pd.DataFrame,
     If q_models is provided, also generates p10/p90 interval bounds.
     Returns a clean output DataFrame with one row per player.
     """
-    results = player_df[["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION",
-                          "MATCHUP", "DAYS_REST", "IS_HOME"]].copy().reset_index(drop=True)
+    base_cols  = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "MATCHUP", "DAYS_REST", "IS_HOME"]
+    extra_cols = [c for c in ["ROLE_CHANGE_FLAG", "ROLE_CHANGE_DELTA"] if c in player_df.columns]
+    results = player_df[base_cols + extra_cols].copy().reset_index(drop=True)
 
     if q_models is None:
         q_models = {}
@@ -640,6 +667,39 @@ def _playoff_elevation_weight(games: int) -> float:
     if games > 0:
         return 0.15
     return 0.00
+
+
+def apply_role_change_adjustment(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    For players flagged with a large role change (|playoff_L5 - reg_L10| > 8 pts),
+    apply an additional direct PTS adjustment of 30% of the gap. This corrects for
+    the model under-trusting the playoff rolling average signal.
+    Called right after calibration so it acts before Vegas merge and playoff boosts.
+    """
+    if "ROLE_CHANGE_FLAG" not in results.columns:
+        logger.info("Role change adjustment: ROLE_CHANGE_FLAG not present -- skipping.")
+        return results
+
+    flagged = results["ROLE_CHANGE_FLAG"] == 1
+    if not flagged.any():
+        logger.info("Role change adjustment: no flagged players.")
+        return results
+
+    results = results.copy()
+    adjustments = []
+
+    for idx, row in results[flagged].iterrows():
+        delta     = float(row["ROLE_CHANGE_DELTA"])
+        extra_pts = round(delta * 0.30, 1)
+        new_pred  = round(max(2.0, float(row["PTS_PRED"]) + extra_pts), 1)
+        results.at[idx, "PTS_PRED"] = new_pred
+        adjustments.append((row["PLAYER_NAME"], delta, extra_pts))
+
+    logger.info(f"Role change adjustment applied: {len(adjustments)} players")
+    for name, delta, extra in sorted(adjustments, key=lambda x: abs(x[2]), reverse=True):
+        logger.info(f"  {name}: {extra:+.1f} pts adjustment (role delta {delta:+.1f})")
+
+    return results
 
 
 def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
@@ -1275,6 +1335,8 @@ if __name__ == "__main__":
                 use_playoff_model=used_playoff_model,
                 fixed_calibration=fixed_calibration,
             )
+            if playoff:
+                results = apply_role_change_adjustment(results)
             results = merge_vegas_lines(results)
             if playoff:
                 logger.info("Playoff games detected -- applying elevation, series adjustment, game 6/7 boost, and rotation filter.")
