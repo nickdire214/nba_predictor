@@ -311,12 +311,31 @@ def build_prediction_input(game_date: str = None):
     except Exception as e:
         logger.warning(f"Could not update rest days from playoff logs: {e}")
 
-    # Update rolling averages using current-season playoff logs.
-    # For players with 3+ playoff games, overwrite L5/L10 averages so the model
-    # sees actual playoff performance rather than stale regular-season numbers.
-    # L20 is intentionally kept as the regular-season baseline.
+    # Confidence blend: gradually replace regular season rolling averages with
+    # current season playoff rolling averages as the playoff sample size grows.
     # playoff_rolling_changes is hoisted so the role change block below can read it.
-    playoff_rolling_changes = []  # (ascii_key, old_pts_l10, new_pts_l5)
+    # It tracks the *pure* playoff L5 average (unblended) vs the regular season
+    # L20 baseline, since that is what signals an actual role change.
+    BLEND_COLS = {
+        "PTS_avg_L5":  ("PTS", 5),  "PTS_avg_L10": ("PTS", 10), "PTS_avg_L20": ("PTS", 20),
+        "REB_avg_L5":  ("REB", 5),  "REB_avg_L10": ("REB", 10), "REB_avg_L20": ("REB", 20),
+        "AST_avg_L5":  ("AST", 5),  "AST_avg_L10": ("AST", 10), "AST_avg_L20": ("AST", 20),
+        "FGA_avg_L5":  ("FGA", 5),  "FGA_avg_L10": ("FGA", 10),
+        "MIN_avg_L5":  ("MIN", 5),  "MIN_avg_L10": ("MIN", 10),
+    }
+
+    def _confidence_blend(ngames: int) -> float:
+        if ngames >= 20:
+            return 1.00
+        if ngames >= 15:
+            return 0.75
+        if ngames >= 10:
+            return 0.50
+        if ngames >= 5:
+            return 0.25
+        return 0.00
+
+    playoff_rolling_changes = []  # (ascii_key, old_pts_l20, playoff_pts_l5, ngames)
     if not playoff_recent.empty:
         try:
             po = playoff_recent.copy()
@@ -330,50 +349,60 @@ def build_prediction_input(game_date: str = None):
                 lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
             )
 
-            n_avg_updated = 0
-            changes = []
+            # Debug: log first 5 players present in playoff_recent but not
+            # found in latest_per_player by ascii name, to catch name mismatches.
+            po_keys = set(po["_name_ascii"].unique())
+            lpp_keys = set(latest_per_player["_name_ascii"].unique())
+            unmatched = sorted(po_keys - lpp_keys)
+            if unmatched:
+                logger.info(f"Confidence blend: {len(unmatched)} playoff_recent players not found in prediction input (showing up to 5):")
+                for k in unmatched[:5]:
+                    logger.info(f"  unmatched playoff_recent name: '{k}'")
+
+            n_blend_applied = 0
+            blend_log = []  # (name, ngames, blend, reg_pts_l5, blended_pts_l5)
 
             for key, group in po.groupby("_name_ascii"):
-                if len(group) < 3:
-                    continue
+                ngames = len(group)
                 mask = latest_per_player["_name_ascii"] == key
                 if not mask.any():
                     continue
 
-                recent5  = group.tail(5)
-                recent10 = group.tail(10)
+                idx0 = latest_per_player.index[mask][0]
 
-                updates = {
-                    "PTS_avg_L5":  round(float(recent5["PTS"].mean()),  2),
-                    "PTS_avg_L10": round(float(recent10["PTS"].mean()), 2),
-                    "REB_avg_L5":  round(float(recent5["REB"].mean()),  2),
-                    "REB_avg_L10": round(float(recent10["REB"].mean()), 2),
-                    "AST_avg_L5":  round(float(recent5["AST"].mean()),  2),
-                    "AST_avg_L10": round(float(recent10["AST"].mean()), 2),
-                }
+                old_pts_l20 = float(latest_per_player.loc[idx0, "PTS_avg_L20"]) if "PTS_avg_L20" in latest_per_player.columns else float("nan")
+                playoff_pts_l5 = round(float(group.tail(5)["PTS"].mean()), 2)
+                playoff_rolling_changes.append((key, old_pts_l20, playoff_pts_l5, ngames))
 
-                idx_list = latest_per_player.index[mask].tolist()
-                old_pts_l5  = float(latest_per_player.loc[idx_list[0], "PTS_avg_L5"])  if "PTS_avg_L5"  in latest_per_player.columns else float("nan")
-                old_pts_l20 = float(latest_per_player.loc[idx_list[0], "PTS_avg_L20"]) if "PTS_avg_L20" in latest_per_player.columns else float("nan")
+                blend = _confidence_blend(ngames)
+                if blend == 0.0:
+                    continue
 
-                for col, val in updates.items():
-                    if col in latest_per_player.columns:
-                        latest_per_player.loc[mask, col] = val
+                reg_pts_l5 = float(latest_per_player.loc[idx0, "PTS_avg_L5"]) if "PTS_avg_L5" in latest_per_player.columns else float("nan")
+                blended_pts_l5 = reg_pts_l5
 
-                n_avg_updated += 1
-                changes.append((group["PLAYER_NAME"].iloc[0], old_pts_l5, updates["PTS_avg_L5"], len(group)))
-                playoff_rolling_changes.append((key, old_pts_l20, updates["PTS_avg_L5"], len(group)))
+                for col, (stat, window) in BLEND_COLS.items():
+                    if col not in latest_per_player.columns or stat not in group.columns:
+                        continue
+                    n_avail = min(window, ngames)
+                    playoff_val = float(group.tail(n_avail)[stat].mean())
+                    reg_val = float(latest_per_player.loc[idx0, col])
+                    blended_val = round((1 - blend) * reg_val + blend * playoff_val, 2)
+                    latest_per_player.loc[mask, col] = blended_val
+                    if col == "PTS_avg_L5":
+                        blended_pts_l5 = blended_val
+
+                n_blend_applied += 1
+                blend_log.append((group["PLAYER_NAME"].iloc[0], ngames, blend, reg_pts_l5, blended_pts_l5))
 
             latest_per_player = latest_per_player.drop(columns=["_name_ascii"])
-            logger.info(
-                f"Playoff rolling averages updated for {n_avg_updated} players "
-                f"using current season playoff logs"
-            )
-            changes.sort(key=lambda x: abs(x[2] - x[1]) if x[1] == x[1] else 0, reverse=True)
-            for name, old_v, new_v, ngames in changes[:5]:
-                logger.info(f"  {name}: {old_v:.1f} -> {new_v:.1f} (statPTS, {ngames} playoff games)")
+            logger.info(f"Confidence blend applied: {n_blend_applied} players")
+            blend_log.sort(key=lambda x: abs(x[4] - x[3]) if x[3] == x[3] else 0, reverse=True)
+            for name, ngames, blend, reg_v, new_v in blend_log[:5]:
+                logger.info(f"  {name}: playoff_games={ngames} blend={blend * 100:.0f}%")
+                logger.info(f"    PTS: {reg_v:.1f} -> {new_v:.1f}")
         except Exception as e:
-            logger.warning(f"Could not update rolling averages from playoff logs: {e}")
+            logger.warning(f"Could not apply confidence blend from playoff logs: {e}")
 
     # Role change flag: mark players whose playoff L5 avg diverges from regular
     # season L10 baseline by more than 8 pts. The adjustment function uses this
