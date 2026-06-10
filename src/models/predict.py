@@ -669,11 +669,17 @@ def _playoff_elevation_weight(games: int) -> float:
     return 0.00
 
 
-def apply_role_change_adjustment(results: pd.DataFrame) -> pd.DataFrame:
+def apply_role_change_adjustment(
+    results: pd.DataFrame,
+    series_df=None,
+) -> pd.DataFrame:
     """
-    For players flagged with a large role change (|playoff_L5 - reg_L10| > 8 pts),
-    apply an additional direct PTS adjustment of 30% of the gap. This corrects for
-    the model under-trusting the playoff rolling average signal.
+    For players flagged with a large role change (|playoff_L5 - reg_L20| > 6 pts,
+    5+ playoff games), apply an additional direct PTS adjustment of 30% of the gap.
+
+    When series_df is provided, players with SERIES_GAMES >= 3 in the current
+    series are suppressed -- the series adjustment signal takes precedence over
+    the broader playoff role change.
     Called right after calibration so it acts before Vegas merge and playoff boosts.
     """
     if "ROLE_CHANGE_FLAG" not in results.columns:
@@ -685,15 +691,30 @@ def apply_role_change_adjustment(results: pd.DataFrame) -> pd.DataFrame:
         logger.info("Role change adjustment: no flagged players.")
         return results
 
+    # Build series lookup: ascii_name -> SERIES_GAMES
+    series_games_map: dict = {}
+    if series_df is not None and not series_df.empty and "PLAYER_NAME_ASCII" in series_df.columns:
+        series_games_map = dict(zip(series_df["PLAYER_NAME_ASCII"], series_df["SERIES_GAMES"]))
+
+    _asc = lambda n: unicodedata.normalize("NFKD", str(n)).encode("ascii", "ignore").decode("ascii").strip()
+
     results = results.copy()
     adjustments = []
 
     for idx, row in results[flagged].iterrows():
+        name      = row["PLAYER_NAME"]
+        key       = _asc(name)
+        series_g  = series_games_map.get(key, 0)
+
+        if series_g >= 3:
+            logger.info(f"Role change suppressed for {name} (3+ series games -- series adjustment takes precedence)")
+            continue
+
         delta     = float(row["ROLE_CHANGE_DELTA"])
         extra_pts = round(delta * 0.30, 1)
         new_pred  = round(max(2.0, float(row["PTS_PRED"]) + extra_pts), 1)
         results.at[idx, "PTS_PRED"] = new_pred
-        adjustments.append((row["PLAYER_NAME"], delta, extra_pts))
+        adjustments.append((name, delta, extra_pts))
 
     logger.info(f"Role change adjustment applied: {len(adjustments)} players")
     for name, delta, extra in sorted(adjustments, key=lambda x: abs(x[2]), reverse=True):
@@ -773,15 +794,15 @@ def apply_playoff_elevation(results: pd.DataFrame) -> pd.DataFrame:
 
 def _series_weight(games: int) -> float:
     if games >= 6:
-        return 0.65
+        return 0.75
     if games == 5:
-        return 0.55
+        return 0.65
     if games == 4:
-        return 0.45
+        return 0.55
     if games == 3:
-        return 0.25
+        return 0.40
     if games == 2:
-        return 0.15
+        return 0.20
     return 0.00
 
 
@@ -817,6 +838,8 @@ def apply_series_adjustment(
     series_idx = series.set_index("PLAYER_NAME_ASCII")
 
     tier_pts = {"6+": [], "5": [], "4": [], "3": [], "2": []}
+    # Track (name, pts_delta, base_weight, final_weight, mag_scale) for top-3 log
+    player_weight_log = []
 
     for idx, row in results.iterrows():
         key = row["_name_ascii"]
@@ -825,8 +848,8 @@ def apply_series_adjustment(
 
         player_series = series_idx.loc[key]
         games = int(player_series["SERIES_GAMES"])
-        weight = _series_weight(games)
-        if weight == 0.0:
+        base_weight = _series_weight(games)
+        if base_weight == 0.0:
             continue
 
         if games >= 6:
@@ -840,17 +863,25 @@ def apply_series_adjustment(
         else:
             bucket = "2"
 
+        pts_delta_raw = float(player_series["SERIES_PTS_DELTA"])
+        magnitude_scale = min(2.0, 1.0 + abs(pts_delta_raw) / 15.0)
+        final_weight = base_weight * magnitude_scale
+
         for stat, delta_col in [
             ("PTS", "SERIES_PTS_DELTA"),
             ("REB", "SERIES_REB_DELTA"),
             ("AST", "SERIES_AST_DELTA"),
         ]:
-            delta = float(player_series[delta_col]) * weight
+            delta = float(player_series[delta_col]) * final_weight
             if stat == "PTS":
                 tier_pts[bucket].append(delta)
             for col in [f"{stat}_PRED", f"{stat}_LOW", f"{stat}_HIGH"]:
                 if col in results.columns and pd.notna(results.at[idx, col]):
                     results.at[idx, col] = round(max(0.0, float(results.at[idx, col]) + delta), 1)
+
+        player_weight_log.append((
+            row["PLAYER_NAME"], pts_delta_raw, base_weight, final_weight, magnitude_scale
+        ))
 
     total = sum(len(v) for v in tier_pts.values())
     logger.info(f"Series adjustment applied: {total} players")
@@ -861,6 +892,14 @@ def apply_series_adjustment(
         if vals:
             avg = sum(vals) / len(vals)
             logger.info(f"  {label}: {len(vals)} players avg {avg:+.1f} pts")
+
+    # Log top-3 most-adjusted players by abs PTS delta * final_weight
+    top3 = sorted(player_weight_log, key=lambda x: abs(x[1] * x[3]), reverse=True)[:3]
+    for name, pts_d, bw, fw, ms in top3:
+        logger.info(
+            f"  {name}: delta {pts_d:+.1f} base_weight {bw:.2f} -> "
+            f"effective_weight {fw:.3f} (magnitude scale {ms:.2f})"
+        )
 
     # Teammate usage redistribution: amplify downward adjustment for cold players
     # whose teammates are absorbing usage. Suppressed in Game 7/elimination games
@@ -1336,7 +1375,14 @@ if __name__ == "__main__":
                 fixed_calibration=fixed_calibration,
             )
             if playoff:
-                results = apply_role_change_adjustment(results)
+                # Fetch series data early so apply_role_change_adjustment can
+                # suppress players who already have 3+ games in the current series.
+                from src.ingestion.series_stats import get_series_adjustments as _get_series
+                try:
+                    _series_df = _get_series(date_str)
+                except Exception:
+                    _series_df = pd.DataFrame()
+                results = apply_role_change_adjustment(results, series_df=_series_df)
             results = merge_vegas_lines(results)
             if playoff:
                 logger.info("Playoff games detected -- applying elevation, series adjustment, game 6/7 boost, and rotation filter.")
